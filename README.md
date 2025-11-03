@@ -1,6 +1,6 @@
 # Unboxed
 
-A native macOS application for converting MBOX email archives to PDF documents. Read more about the application at my [dev blog](https://pages.github.com/](https://jwise.dev/unboxing-vaults-mail/).
+A native macOS application for converting MBOX email archives to PDF documents. Read more about the application on [my dev blog](https://jwise.dev/unboxing-vaults-mail).
 
 ## Features
 
