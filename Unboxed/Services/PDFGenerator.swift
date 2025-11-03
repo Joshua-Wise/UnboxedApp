@@ -55,11 +55,11 @@ class PDFGenerator {
         }
     }
 
-    static func generateSinglePDF(emails: [Email], outputURL: URL) throws {
+    static func generateSinglePDF(emails: [Email], outputURL: URL) async throws {
         let pdfDocument = PDFDocument()
 
         for (index, email) in emails.enumerated() {
-            if let page = createPage(for: email, pageNumber: index + 1, totalPages: emails.count) {
+            if let page = await createPage(for: email, pageNumber: index + 1, totalPages: emails.count) {
                 pdfDocument.insert(page, at: pdfDocument.pageCount)
             }
         }
@@ -78,22 +78,27 @@ class PDFGenerator {
         // Get concurrency limit from settings (default to 4 if not set)
         let maxConcurrent = settings.maxConcurrentPDFs
 
+        // Pre-compute filenames (on main actor) to avoid calling buildFilename from background tasks
+        let filenames = emails.enumerated().map { (index, email) in
+            settings.buildFilename(for: email, index: index + 1)
+        }
+
         // Create progress tracker
         let progressTracker = ProgressTracker(total: emails.count, callback: progressCallback)
 
         // Create a semaphore to limit concurrent tasks
         let semaphore = AsyncSemaphore(maxCount: maxConcurrent)
 
-        // Storage for results and errors
-        var pdfURLs: [URL] = []
-        var errors: [Error] = []
-        let lock = NSLock()
+        // Storage for results and errors using actor
+        let resultStore = ResultStore()
 
         // Use TaskGroup for parallel processing
-        try await withThrowingTaskGroup(of: URL?.self) { group in
+        try await withThrowingTaskGroup(of: Void.self) { group in
             for (index, email) in emails.enumerated() {
                 // Wait for semaphore before starting new task
                 await semaphore.wait()
+
+                let filename = filenames[index]
 
                 group.addTask {
                     defer {
@@ -103,11 +108,10 @@ class PDFGenerator {
                     }
 
                     do {
-                        let filename = settings.buildFilename(for: email, index: index + 1)
                         let fileURL = outputDirectory.appendingPathComponent(filename)
 
                         let pdfDocument = PDFDocument()
-                        if let page = createPage(for: email, pageNumber: 1, totalPages: 1) {
+                        if let page = await createPage(for: email, pageNumber: 1, totalPages: 1) {
                             pdfDocument.insert(page, at: 0)
                         }
 
@@ -115,30 +119,24 @@ class PDFGenerator {
                             throw GeneratorError.saveFailed("Could not write to \(fileURL.path)")
                         }
 
+                        // Store result
+                        await resultStore.addURL(fileURL)
+
                         // Update progress
                         await progressTracker.increment()
-
-                        return fileURL
                     } catch {
-                        lock.lock()
-                        errors.append(error)
-                        lock.unlock()
-
+                        await resultStore.addError(error)
                         await progressTracker.increment()
-                        return nil
                     }
                 }
             }
 
-            // Collect results
-            for try await result in group {
-                if let url = result {
-                    lock.lock()
-                    pdfURLs.append(url)
-                    lock.unlock()
-                }
-            }
+            // Wait for all tasks to complete
+            try await group.waitForAll()
         }
+
+        let pdfURLs = await resultStore.urls
+        let errors = await resultStore.errors
 
         // Report completion
         await progressCallback?(1.0, "Generated \(pdfURLs.count) PDFs")
@@ -189,42 +187,78 @@ class PDFGenerator {
         }
     }
 
-    private static func createPage(for email: Email, pageNumber: Int, totalPages: Int) -> PDFPage? {
+    // Thread-safe storage for results
+    private actor ResultStore {
+        private(set) var urls: [URL] = []
+        private(set) var errors: [Error] = []
+
+        func addURL(_ url: URL) {
+            urls.append(url)
+        }
+
+        func addError(_ error: Error) {
+            errors.append(error)
+        }
+    }
+
+    // Custom view for rendering email content to PDF
+    private class EmailContentView: NSView {
+        private let content: NSAttributedString
+        private let contentRect: CGRect
+
+        init(frame: NSRect, content: NSAttributedString, contentRect: CGRect) {
+            self.content = content
+            self.contentRect = contentRect
+            super.init(frame: frame)
+        }
+
+        required init?(coder: NSCoder) {
+            fatalError("init(coder:) has not been implemented")
+        }
+
+        override func draw(_ dirtyRect: NSRect) {
+            // Fill background with white
+            NSColor.white.setFill()
+            dirtyRect.fill()
+
+            // Draw the attributed string in the content rect
+            content.draw(in: contentRect)
+        }
+    }
+
+    private static func createPage(for email: Email, pageNumber: Int, totalPages: Int) async -> PDFPage? {
         // Create an NSAttributedString for the content
         let content = createAttributedContent(for: email, pageNumber: pageNumber, totalPages: totalPages)
 
         // Page dimensions (US Letter)
         let pageRect = CGRect(x: 0, y: 0, width: 612, height: 792) // 8.5" x 11" at 72 DPI
-        let contentRect = pageRect.insetBy(dx: 54, dy: 54) // 0.75" margins
+        let margin: CGFloat = 54 // 0.75" margins
+        let contentRect = CGRect(
+            x: margin,
+            y: margin,
+            width: pageRect.width - (2 * margin),
+            height: pageRect.height - (2 * margin)
+        )
 
-        // Create PDF page data
-        var mediaBox = pageRect
-        let pdfData = NSMutableData()
-        guard let consumer = CGDataConsumer(data: pdfData as CFMutableData),
-              let pdfContext = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else {
-            return nil
+        // NSView operations must run on main thread
+        return await MainActor.run {
+            // Create a custom view to render the content
+            let view = EmailContentView(frame: pageRect, content: content, contentRect: contentRect)
+
+            // Create PDF data using the view
+            let pdfData = view.dataWithPDF(inside: pageRect)
+
+            // Create PDFPage from the rendered data
+            guard let pdfDoc = PDFDocument(data: pdfData),
+                  let pdfPage = pdfDoc.page(at: 0) else {
+                return nil
+            }
+
+            return pdfPage
         }
-
-        pdfContext.beginPage(mediaBox: &mediaBox)
-
-        // Draw the content
-        let framesetter = CTFramesetterCreateWithAttributedString(content as CFAttributedString)
-        let path = CGPath(rect: contentRect, transform: nil)
-        let frame = CTFramesetterCreateFrame(framesetter, CFRangeMake(0, content.length), path, nil)
-
-        pdfContext.textMatrix = .identity
-        pdfContext.translateBy(x: 0, y: pageRect.height)
-        pdfContext.scaleBy(x: 1.0, y: -1.0)
-
-        CTFrameDraw(frame, pdfContext)
-
-        pdfContext.endPage()
-        pdfContext.closePDF()
-
-        return PDFPage(image: NSImage(data: pdfData as Data) ?? NSImage())
     }
 
-    private static func createAttributedContent(for email: Email, pageNumber: Int, totalPages: Int) -> NSAttributedString {
+    nonisolated private static func createAttributedContent(for email: Email, pageNumber: Int, totalPages: Int) -> NSAttributedString {
         let content = NSMutableAttributedString()
 
         // Title style

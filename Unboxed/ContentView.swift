@@ -475,7 +475,7 @@ struct HomeView: View {
                             historyManager.addItem(historyItem)
                         }
                     } else {
-                        try PDFGenerator.generateSinglePDF(emails: selectedEmails, outputURL: outputURL)
+                        try await PDFGenerator.generateSinglePDF(emails: selectedEmails, outputURL: outputURL)
 
                         await MainActor.run {
                             var message = "Successfully converted \(selectedEmails.count) email(s) to PDF"

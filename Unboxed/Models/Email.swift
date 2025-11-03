@@ -26,14 +26,14 @@ struct Email: Identifiable, Codable {
 }
 
 extension Email {
-    var formattedDate: String {
+    nonisolated var formattedDate: String {
         guard let date = date else { return dateString }
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
         return formatter.string(from: date)
     }
 
-    var shortDate: String {
+    nonisolated var shortDate: String {
         guard let date = date else {
             // Try to extract date from dateString
             if dateString.count >= 10 {
@@ -46,7 +46,7 @@ extension Email {
         return formatter.string(from: date)
     }
 
-    var senderName: String {
+    nonisolated var senderName: String {
         // Extract name or email from "Name <email@example.com>" format
         if from.contains("<") {
             if let name = from.components(separatedBy: "<").first?.trimmingCharacters(in: .whitespaces), !name.isEmpty {
