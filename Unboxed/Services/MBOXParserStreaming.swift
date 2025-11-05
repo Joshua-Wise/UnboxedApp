@@ -80,6 +80,11 @@ class MBOXParserStreaming {
         var bytesRead: Int64 = 0
         let chunkSize = 1024 * 1024 // 1MB chunks
 
+        // Batch processing for parallel email parsing
+        var messageBatch: [(String, Int)] = [] // (messageText, index)
+        let batchSize = 25 // Process emails in batches for better performance
+        let maxConcurrency = min(4, ProcessInfo.processInfo.processorCount) // Limit based on CPU cores
+
         await progressCallback(0.01, "Reading MBOX file...")
 
         // Read file in chunks
@@ -125,21 +130,25 @@ class MBOXParserStreaming {
             for line in lines.dropLast() {
                 // Check for message boundary "From " at start of line
                 if line.starts(with: "From ") && !currentMessage.isEmpty {
-                    // Process previous message
+                    // Add message to batch for parallel processing
                     emailIndex += 1
+                    messageBatch.append((currentMessage, emailIndex))
 
-                    if emailIndex % 10 == 0 {
+                    // Process batch when it reaches batchSize
+                    if messageBatch.count >= batchSize {
+                        let (batchEmails, batchSkipped) = await processBatch(
+                            messageBatch,
+                            sourceFileName: sourceFileName,
+                            maxBodySizeBytes: maxBodySizeBytes,
+                            maxConcurrency: maxConcurrency
+                        )
+                        emails.append(contentsOf: batchEmails)
+                        skippedEmails.append(contentsOf: batchSkipped)
+                        messageBatch.removeAll()
+
+                        // Progress update
                         let progress = Double(bytesRead) / Double(fileSize)
                         await progressCallback(progress * 0.8, "Parsed \(emailIndex) emails...")
-                    }
-
-                    let result = parseEmail(messageText: currentMessage, index: emailIndex, sourceFile: sourceFileName, maxBodySizeBytes: maxBodySizeBytes)
-                    switch result {
-                    case .success(let email):
-                        emails.append(email)
-                    case .skipped(let reason):
-                        skippedEmails.append(SkippedEmail(index: emailIndex, reason: reason))
-                        print("⚠️ Skipped email #\(emailIndex): \(reason)")
                     }
 
                     // Start new message
@@ -158,14 +167,19 @@ class MBOXParserStreaming {
         // Process last message
         if !currentMessage.isEmpty {
             emailIndex += 1
-            let result = parseEmail(messageText: currentMessage, index: emailIndex, sourceFile: sourceFileName, maxBodySizeBytes: maxBodySizeBytes)
-            switch result {
-            case .success(let email):
-                emails.append(email)
-            case .skipped(let reason):
-                skippedEmails.append(SkippedEmail(index: emailIndex, reason: reason))
-                print("⚠️ Skipped email #\(emailIndex): \(reason)")
-            }
+            messageBatch.append((currentMessage, emailIndex))
+        }
+
+        // Process any remaining messages in the final batch
+        if !messageBatch.isEmpty {
+            let (batchEmails, batchSkipped) = await processBatch(
+                messageBatch,
+                sourceFileName: sourceFileName,
+                maxBodySizeBytes: maxBodySizeBytes,
+                maxConcurrency: maxConcurrency
+            )
+            emails.append(contentsOf: batchEmails)
+            skippedEmails.append(contentsOf: batchSkipped)
         }
 
         guard !emails.isEmpty else {
@@ -193,6 +207,92 @@ class MBOXParserStreaming {
         return result
     }
 
+    // Process a batch of messages in parallel for better performance
+    private static func processBatch(
+        _ messageBatch: [(String, Int)],
+        sourceFileName: String,
+        maxBodySizeBytes: Int,
+        maxConcurrency: Int
+    ) async -> ([Email], [SkippedEmail]) {
+        var emails: [Email] = []
+        var skippedEmails: [SkippedEmail] = []
+
+        // Use TaskGroup for parallel email parsing
+        await withTaskGroup(of: (Int, ParseEmailResult).self) { group in
+            let semaphore = BatchSemaphore(maxCount: maxConcurrency)
+
+            for (messageText, index) in messageBatch {
+                await semaphore.wait()
+
+                group.addTask {
+                    defer {
+                        Task { await semaphore.signal() }
+                    }
+
+                    let result = parseEmail(
+                        messageText: messageText,
+                        index: index,
+                        sourceFile: sourceFileName,
+                        maxBodySizeBytes: maxBodySizeBytes
+                    )
+                    return (index, result)
+                }
+            }
+
+            // Collect results maintaining order
+            var results: [(Int, ParseEmailResult)] = []
+            for await result in group {
+                results.append(result)
+            }
+
+            // Sort by index to maintain email order
+            results.sort { $0.0 < $1.0 }
+
+            // Process results in order
+            for (_, result) in results {
+                switch result {
+                case .success(let email):
+                    emails.append(email)
+                case .skipped(let reason):
+                    skippedEmails.append(SkippedEmail(index: emails.count + skippedEmails.count + 1, reason: reason))
+                }
+            }
+        }
+
+        return (emails, skippedEmails)
+    }
+
+    // Simple semaphore for batch processing
+    private actor BatchSemaphore {
+        private var count = 0
+        private let maxCount: Int
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        init(maxCount: Int) {
+            self.maxCount = maxCount
+        }
+
+        func wait() async {
+            if count < maxCount {
+                count += 1
+                return
+            }
+
+            await withCheckedContinuation { continuation in
+                waiters.append(continuation)
+            }
+        }
+
+        func signal() {
+            if let waiter = waiters.first {
+                waiters.removeFirst()
+                waiter.resume()
+            } else {
+                count -= 1
+            }
+        }
+    }
+
     enum ParseEmailResult {
         case success(Email)
         case skipped(String)
@@ -213,6 +313,11 @@ class MBOXParserStreaming {
             guard line.count < 1_000_000 else { continue }
 
             if inHeaders {
+                // Skip the "From " line (MBOX boundary) - it's not an email header
+                if idx == 0 && line.hasPrefix("From ") {
+                    continue
+                }
+
                 if line.isEmpty {
                     // End of headers
                     if !currentHeader.isEmpty {
@@ -220,41 +325,78 @@ class MBOXParserStreaming {
                     }
                     bodyStartIndex = idx + 1
                     inHeaders = false
+                    break
                 } else if line.first?.isWhitespace == true {
                     // Continuation of previous header
                     currentValue += " " + line.trimmingCharacters(in: .whitespacesAndNewlines)
                 } else if let colonIndex = line.firstIndex(of: ":") {
-                    // New header
-                    if !currentHeader.isEmpty {
-                        headers[currentHeader.lowercased()] = currentValue.trimmingCharacters(in: .whitespacesAndNewlines)
-                    }
-                    currentHeader = String(line[..<colonIndex])
-                    if colonIndex < line.endIndex {
-                        let valueStart = line.index(after: colonIndex)
-                        currentValue = String(line[valueStart...])
+                    // Check if this looks like a valid email header (not HTML content)
+                    let headerName = String(line[..<colonIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+
+                    // Valid email headers should:
+                    // 1. Not contain HTML-like content (=, <, >, 3D)
+                    // 2. Not be longer than reasonable (avoid HTML fragments)
+                    // 3. Not contain spaces (except for some continuation cases)
+                    // 4. Have reasonable total line length
+                    let isValidHeader = !headerName.contains("=") &&
+                                       !headerName.contains("<") &&
+                                       !headerName.contains(">") &&
+                                       !headerName.contains("3D") &&
+                                       headerName.count < 50 &&
+                                       line.count < 1000 && // Avoid extremely long corrupted headers
+                                       (!headerName.contains(" ") ||
+                                        headerName.lowercased().hasPrefix("received")) // Special case for "Received" headers
+
+                    if isValidHeader {
+                        // New valid header
+                        if !currentHeader.isEmpty {
+                            headers[currentHeader.lowercased()] = currentValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                        }
+                        currentHeader = headerName
+                        if colonIndex < line.endIndex {
+                            let valueStart = line.index(after: colonIndex)
+                            currentValue = String(line[valueStart...])
+                        } else {
+                            currentValue = ""
+                        }
                     } else {
-                        currentValue = ""
+                        // This looks like HTML content, we've probably reached the body
+                        // End header parsing here
+                        if !currentHeader.isEmpty {
+                            headers[currentHeader.lowercased()] = currentValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                        }
+                        bodyStartIndex = idx
+                        inHeaders = false
+                        break
                     }
                 }
             }
         }
 
+        // If we never found an empty line, set bodyStartIndex to end of lines
+        if inHeaders {
+            bodyStartIndex = lines.count
+        }
+
         // Extract body with user-configurable size limit
         let bodyLines = Array(lines[bodyStartIndex...])
-        let bodyText = bodyLines.joined(separator: "\n")
+        let rawBodyText = bodyLines.joined(separator: "\n")
+
+        // Extract readable content from MIME email
+        let decodedBody = extractReadableBody(rawBody: rawBodyText, headers: headers)
 
         var body: String
 
-        if bodyText.count > maxBodySizeBytes {
-            body = String(bodyText.prefix(maxBodySizeBytes))
-            let truncatedBytes = bodyText.count - maxBodySizeBytes
+        if decodedBody.count > maxBodySizeBytes {
+            body = String(decodedBody.prefix(maxBodySizeBytes))
+            let truncatedBytes = decodedBody.count - maxBodySizeBytes
             let truncatedMB = Double(truncatedBytes) / 1_000_000
             body += "\n\n" + String(repeating: "=", count: 50)
             body += "\n[CONTENT TRUNCATED - \(String(format: "%.1f", truncatedMB))MB of content not displayed]"
-            body += "\n[Original size: \(String(format: "%.1f", Double(bodyText.count) / 1_000_000))MB]"
+            body += "\n[Original size: \(String(format: "%.1f", Double(decodedBody.count) / 1_000_000))MB]"
             body += "\n" + String(repeating: "=", count: 50)
         } else {
-            body = bodyText
+            body = decodedBody
         }
 
         body = body.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -365,5 +507,142 @@ class MBOXParserStreaming {
         }
 
         return nil
+    }
+
+    private static func extractReadableBody(rawBody: String, headers: [String: String]) -> String {
+        let contentType = headers["content-type"] ?? ""
+        let encoding = headers["content-transfer-encoding"] ?? ""
+
+        // Check if it's a multipart email
+        if contentType.lowercased().contains("multipart") {
+            return extractMultipartBody(rawBody: rawBody, contentType: contentType)
+        }
+
+        // Single part email - check for encoding
+        return decodeBody(rawBody.trimmingCharacters(in: .whitespacesAndNewlines), encoding: encoding)
+    }
+
+    private static func extractMultipartBody(rawBody: String, contentType: String) -> String {
+        // Extract boundary from Content-Type header
+        guard let boundaryRange = contentType.range(of: "boundary=") else {
+            return rawBody.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let boundaryStart = boundaryRange.upperBound
+        var boundary = String(contentType[boundaryStart...])
+
+        // Remove quotes if present
+        if boundary.hasPrefix("\"") && boundary.hasSuffix("\"") {
+            boundary = String(boundary.dropFirst().dropLast())
+        }
+
+        // Split by boundary
+        let parts = rawBody.components(separatedBy: "--\(boundary)")
+
+        // Look for text/plain or text/html parts
+        for part in parts {
+            guard !part.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+
+            let partLines = part.components(separatedBy: "\n")
+            var partHeaders: [String: String] = [:]
+            var partBodyStartIndex = 0
+
+            // Parse part headers
+            for (idx, line) in partLines.enumerated() {
+                if line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    partBodyStartIndex = idx + 1
+                    break
+                } else if let colonIndex = line.firstIndex(of: ":") {
+                    let headerName = String(line[..<colonIndex]).lowercased()
+                    let headerValue = String(line[line.index(after: colonIndex)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    partHeaders[headerName] = headerValue
+                }
+            }
+
+            let partContentType = partHeaders["content-type"] ?? ""
+
+            // Prefer text/plain, fall back to text/html
+            if partContentType.contains("text/plain") {
+                let partBodyLines = Array(partLines[partBodyStartIndex...])
+                let partBody = partBodyLines.joined(separator: "\n")
+                let encoding = partHeaders["content-transfer-encoding"] ?? ""
+                return decodeBody(partBody.trimmingCharacters(in: .whitespacesAndNewlines), encoding: encoding)
+            }
+        }
+
+        // If no text/plain found, look for text/html
+        for part in parts {
+            guard !part.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+
+            let partLines = part.components(separatedBy: "\n")
+            var partHeaders: [String: String] = [:]
+            var partBodyStartIndex = 0
+
+            for (idx, line) in partLines.enumerated() {
+                if line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    partBodyStartIndex = idx + 1
+                    break
+                } else if let colonIndex = line.firstIndex(of: ":") {
+                    let headerName = String(line[..<colonIndex]).lowercased()
+                    let headerValue = String(line[line.index(after: colonIndex)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    partHeaders[headerName] = headerValue
+                }
+            }
+
+            let partContentType = partHeaders["content-type"] ?? ""
+
+            if partContentType.contains("text/html") {
+                let partBodyLines = Array(partLines[partBodyStartIndex...])
+                let partBody = partBodyLines.joined(separator: "\n")
+                let encoding = partHeaders["content-transfer-encoding"] ?? ""
+                return decodeBody(partBody.trimmingCharacters(in: .whitespacesAndNewlines), encoding: encoding)
+            }
+        }
+
+        // Fallback to raw body
+        return rawBody.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func decodeBody(_ body: String, encoding: String) -> String {
+        let normalizedEncoding = encoding.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+
+        switch normalizedEncoding {
+        case "base64":
+            if let data = Data(base64Encoded: body.replacingOccurrences(of: "\n", with: "")),
+               let decodedString = String(data: data, encoding: .utf8) {
+                return decodedString
+            }
+            return body
+
+        case "quoted-printable":
+            return decodeQuotedPrintableBody(body)
+
+        default:
+            return body
+        }
+    }
+
+    private static func decodeQuotedPrintableBody(_ text: String) -> String {
+        var result = text
+
+        // Handle soft line breaks (= at end of line)
+        result = result.replacingOccurrences(of: "=\n", with: "")
+        result = result.replacingOccurrences(of: "=\r\n", with: "")
+
+        // Decode =XX hex sequences
+        let pattern = "=([0-9A-F]{2})"
+        if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
+            let matches = regex.matches(in: result, range: NSRange(result.startIndex..., in: result))
+            for match in matches.reversed() {
+                guard let range = Range(match.range, in: result) else { continue }
+                let hexString = String(result[range].dropFirst()) // Remove "="
+                if let value = UInt8(hexString, radix: 16) {
+                    let char = String(Character(UnicodeScalar(value)))
+                    result = result.replacingCharacters(in: range, with: char)
+                }
+            }
+        }
+
+        return result
     }
 }

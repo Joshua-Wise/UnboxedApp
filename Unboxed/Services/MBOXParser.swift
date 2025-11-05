@@ -36,24 +36,65 @@ class MBOXParser {
 
         let sourceFileName = fileURL.deletingPathExtension().lastPathComponent
 
+        print("🗂️ MBOX file parsing debug:")
+        print("   File: \(sourceFileName)")
+        print("   Total content length: \(content.count)")
+        print("   Content preview (first 500 chars): '\(String(content.prefix(500)))'")
+
         // Split by "From " at the beginning of lines (MBOX format)
-        let messages = content.components(separatedBy: "\nFrom ")
+        // First, normalize line endings and split into lines
+        let normalizedContent = content.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+        let allLines = normalizedContent.components(separatedBy: "\n")
+
+        print("   Total lines in MBOX: \(allLines.count)")
+        print("   First 10 lines:")
+        for (i, line) in allLines.prefix(10).enumerated() {
+            print("     \(i): '\(line)'")
+        }
+
+        // Find message boundaries (lines starting with "From ")
+        var messageStartIndices: [Int] = []
+        for (index, line) in allLines.enumerated() {
+            if line.hasPrefix("From ") {
+                messageStartIndices.append(index)
+                print("   Found 'From ' boundary at line \(index): '\(String(line.prefix(100)))...'")
+            }
+        }
+
+        print("   Found \(messageStartIndices.count) 'From ' boundaries")
+
+        // Extract individual messages
+        var messages: [String] = []
+        for (i, startIndex) in messageStartIndices.enumerated() {
+            let endIndex = (i < messageStartIndices.count - 1) ? messageStartIndices[i + 1] : allLines.count
+            let messageLines = Array(allLines[startIndex..<endIndex])
+            let message = messageLines.joined(separator: "\n")
+            messages.append(message)
+        }
+
+        print("   Extracted \(messages.count) complete messages")
+
         var emails: [Email] = []
 
         for (index, message) in messages.enumerated() {
+            print("   Processing message \(index + 1):")
+            print("     Raw message length: \(message.count)")
+            print("     Raw message preview: '\(String(message.prefix(200)))'")
+
             // Skip empty messages
             guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                print("     ⚠️ Skipping empty message")
                 continue
             }
 
-            var messageText = message
-            // Add back "From " for all except first message
-            if index > 0 {
-                messageText = "From " + messageText
-            }
+            // Message already includes "From " line, no need to add it back
+            print("     Final message length: \(message.count)")
 
-            if let email = parseEmail(messageText: messageText, index: index + 1, sourceFile: sourceFileName) {
+            if let email = parseEmail(messageText: message, index: index + 1, sourceFile: sourceFileName) {
                 emails.append(email)
+                print("     ✅ Successfully parsed email")
+            } else {
+                print("     ❌ Failed to parse email")
             }
         }
 
@@ -65,7 +106,16 @@ class MBOXParser {
     }
 
     private static func parseEmail(messageText: String, index: Int, sourceFile: String) -> Email? {
+        print("🔍 parseEmail called for message #\(index)")
+        print("   Message length: \(messageText.count)")
+
         let lines = messageText.components(separatedBy: "\n")
+        print("   Split into \(lines.count) lines")
+        print("   First few lines:")
+        for (i, line) in lines.prefix(5).enumerated() {
+            print("     Line \(i): '\(line)'")
+        }
+
         var headers: [String: String] = [:]
         var bodyStartIndex = 0
         var inHeaders = true
@@ -74,8 +124,17 @@ class MBOXParser {
         var currentHeader = ""
         var currentValue = ""
 
+        print("📝 Header parsing debug for email #\(index):")
+        print("   Total lines: \(lines.count)")
+
         for (idx, line) in lines.enumerated() {
             if inHeaders {
+                // Skip the "From " line (MBOX boundary) - it's not an email header
+                if idx == 0 && line.hasPrefix("From ") {
+                    print("   → Skipping MBOX boundary line: '\(String(line.prefix(100)))...'")
+                    continue
+                }
+
                 if line.isEmpty {
                     // End of headers
                     if !currentHeader.isEmpty {
@@ -83,23 +142,69 @@ class MBOXParser {
                     }
                     bodyStartIndex = idx + 1
                     inHeaders = false
+                    print("   Found empty line at index \(idx), bodyStartIndex set to \(bodyStartIndex)")
+                    break
                 } else if line.first?.isWhitespace == true {
                     // Continuation of previous header
                     currentValue += " " + line.trimmingCharacters(in: .whitespacesAndNewlines)
                 } else if let colonIndex = line.firstIndex(of: ":") {
-                    // New header
-                    if !currentHeader.isEmpty {
-                        headers[currentHeader.lowercased()] = currentValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                    // Check if this looks like a valid email header (not HTML content)
+                    let headerName = String(line[..<colonIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+
+                    // Valid email headers should:
+                    // 1. Not contain HTML-like content (=, <, >, 3D)
+                    // 2. Not be longer than reasonable (avoid HTML fragments)
+                    // 3. Not contain spaces (except for some continuation cases)
+                    let isValidHeader = !headerName.contains("=") &&
+                                       !headerName.contains("<") &&
+                                       !headerName.contains(">") &&
+                                       !headerName.contains("3D") &&
+                                       headerName.count < 50 &&
+                                       !headerName.contains(" ") ||
+                                       headerName.lowercased().hasPrefix("received") // Special case for "Received" headers
+
+                    if isValidHeader {
+                        // New valid header
+                        if !currentHeader.isEmpty {
+                            headers[currentHeader.lowercased()] = currentValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                        }
+                        currentHeader = headerName
+                        currentValue = String(line[line.index(after: colonIndex)...])
+                    } else {
+                        print("   ⚠️ Skipping invalid header line: '\(String(line.prefix(100)))...'")
+                        // This looks like HTML content, we've probably reached the body
+                        // End header parsing here
+                        if !currentHeader.isEmpty {
+                            headers[currentHeader.lowercased()] = currentValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                        }
+                        bodyStartIndex = idx
+                        inHeaders = false
+                        print("   → Detected HTML-like content, ending headers at line \(idx)")
+                        break
                     }
-                    currentHeader = String(line[..<colonIndex])
-                    currentValue = String(line[line.index(after: colonIndex)...])
                 }
             }
         }
 
+        // If we never found an empty line, set bodyStartIndex to end of lines
+        if inHeaders {
+            print("   ⚠️ Never found empty line to end headers, setting bodyStartIndex to \(lines.count)")
+            bodyStartIndex = lines.count
+        }
+
+        print("   Final bodyStartIndex: \(bodyStartIndex)")
+        print("   Lines available for body: \(max(0, lines.count - bodyStartIndex))")
+
+        // Debug: Print all parsed headers
+        print("📧 Parsed headers for email #\(index):")
+        for (key, value) in headers {
+            print("   \(key): \(value)")
+        }
+
         // Extract body
         let bodyLines = Array(lines[bodyStartIndex...])
-        let body = bodyLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawBody = bodyLines.joined(separator: "\n")
+        let body = extractReadableBody(rawBody: rawBody, headers: headers)
 
         // Parse date
         var parsedDate: Date?
@@ -198,5 +303,151 @@ class MBOXParser {
         }
 
         return nil
+    }
+
+    private static func extractReadableBody(rawBody: String, headers: [String: String]) -> String {
+        let contentType = headers["content-type"] ?? ""
+        let encoding = headers["content-transfer-encoding"] ?? ""
+
+        // Debug logging
+        print("🔍 Email body extraction debug:")
+        print("   Content-Type: '\(contentType)'")
+        print("   Content-Transfer-Encoding: '\(encoding)'")
+        print("   Raw body length: \(rawBody.count)")
+        print("   Raw body preview: '\(String(rawBody.prefix(200)))'")
+
+        // Check if it's a multipart email
+        if contentType.lowercased().contains("multipart") {
+            print("   → Processing as multipart email")
+            return extractMultipartBody(rawBody: rawBody, contentType: contentType)
+        }
+
+        // Single part email - check for encoding
+        let result = decodeBody(rawBody.trimmingCharacters(in: .whitespacesAndNewlines), encoding: encoding)
+        return result
+    }
+
+    private static func extractMultipartBody(rawBody: String, contentType: String) -> String {
+        // Extract boundary from Content-Type header
+        guard let boundaryRange = contentType.range(of: "boundary=") else {
+            return rawBody.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let boundaryStart = boundaryRange.upperBound
+        var boundary = String(contentType[boundaryStart...])
+
+        // Remove quotes if present
+        if boundary.hasPrefix("\"") && boundary.hasSuffix("\"") {
+            boundary = String(boundary.dropFirst().dropLast())
+        }
+
+        // Split by boundary
+        let parts = rawBody.components(separatedBy: "--\(boundary)")
+
+        // Look for text/plain or text/html parts
+        for part in parts {
+            guard !part.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+
+            let partLines = part.components(separatedBy: "\n")
+            var partHeaders: [String: String] = [:]
+            var partBodyStartIndex = 0
+
+            // Parse part headers
+            for (idx, line) in partLines.enumerated() {
+                if line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    partBodyStartIndex = idx + 1
+                    break
+                } else if let colonIndex = line.firstIndex(of: ":") {
+                    let headerName = String(line[..<colonIndex]).lowercased()
+                    let headerValue = String(line[line.index(after: colonIndex)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    partHeaders[headerName] = headerValue
+                }
+            }
+
+            let partContentType = partHeaders["content-type"] ?? ""
+
+            // Prefer text/plain, fall back to text/html
+            if partContentType.contains("text/plain") {
+                let partBodyLines = Array(partLines[partBodyStartIndex...])
+                let partBody = partBodyLines.joined(separator: "\n")
+                let encoding = partHeaders["content-transfer-encoding"] ?? ""
+                return decodeBody(partBody.trimmingCharacters(in: .whitespacesAndNewlines), encoding: encoding)
+            }
+        }
+
+        // If no text/plain found, look for text/html
+        for part in parts {
+            guard !part.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+
+            let partLines = part.components(separatedBy: "\n")
+            var partHeaders: [String: String] = [:]
+            var partBodyStartIndex = 0
+
+            for (idx, line) in partLines.enumerated() {
+                if line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    partBodyStartIndex = idx + 1
+                    break
+                } else if let colonIndex = line.firstIndex(of: ":") {
+                    let headerName = String(line[..<colonIndex]).lowercased()
+                    let headerValue = String(line[line.index(after: colonIndex)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    partHeaders[headerName] = headerValue
+                }
+            }
+
+            let partContentType = partHeaders["content-type"] ?? ""
+
+            if partContentType.contains("text/html") {
+                let partBodyLines = Array(partLines[partBodyStartIndex...])
+                let partBody = partBodyLines.joined(separator: "\n")
+                let encoding = partHeaders["content-transfer-encoding"] ?? ""
+                return decodeBody(partBody.trimmingCharacters(in: .whitespacesAndNewlines), encoding: encoding)
+            }
+        }
+
+        // Fallback to raw body
+        return rawBody.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func decodeBody(_ body: String, encoding: String) -> String {
+        let normalizedEncoding = encoding.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+
+        switch normalizedEncoding {
+        case "base64":
+            if let data = Data(base64Encoded: body.replacingOccurrences(of: "\n", with: "")),
+               let decodedString = String(data: data, encoding: .utf8) {
+                return decodedString
+            }
+            return body
+
+        case "quoted-printable":
+            return decodeQuotedPrintableBody(body)
+
+        default:
+            return body
+        }
+    }
+
+    private static func decodeQuotedPrintableBody(_ text: String) -> String {
+        var result = text
+
+        // Handle soft line breaks (= at end of line)
+        result = result.replacingOccurrences(of: "=\n", with: "")
+        result = result.replacingOccurrences(of: "=\r\n", with: "")
+
+        // Decode =XX hex sequences
+        let pattern = "=([0-9A-F]{2})"
+        if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
+            let matches = regex.matches(in: result, range: NSRange(result.startIndex..., in: result))
+            for match in matches.reversed() {
+                guard let range = Range(match.range, in: result) else { continue }
+                let hexString = String(result[range].dropFirst()) // Remove "="
+                if let value = UInt8(hexString, radix: 16) {
+                    let char = String(Character(UnicodeScalar(value)))
+                    result = result.replacingCharacters(in: range, with: char)
+                }
+            }
+        }
+
+        return result
     }
 }

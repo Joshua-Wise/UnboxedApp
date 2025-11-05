@@ -75,8 +75,21 @@ class PDFGenerator {
         settings: AppSettings,
         progressCallback: ((Double, String) async -> Void)? = nil
     ) async throws -> [URL] {
-        // Get concurrency limit from settings (default to 4 if not set)
-        let maxConcurrent = settings.maxConcurrentPDFs
+        // Analyze content sizes to adjust concurrency
+        let largeEmailCount = emails.filter { $0.body.count > 500_000 }.count
+        let hugeEmailCount = emails.filter { $0.body.count > 2_000_000 }.count
+
+        // Reduce concurrency for large content to prevent memory issues
+        var adjustedConcurrency = settings.maxConcurrentPDFs
+        if hugeEmailCount > 0 {
+            adjustedConcurrency = min(2, adjustedConcurrency) // Max 2 for huge emails
+            print("📊 Detected \(hugeEmailCount) huge emails (>2MB), reducing concurrency to \(adjustedConcurrency)")
+        } else if largeEmailCount > 5 {
+            adjustedConcurrency = min(3, adjustedConcurrency) // Max 3 for many large emails
+            print("📊 Detected \(largeEmailCount) large emails (>500KB), reducing concurrency to \(adjustedConcurrency)")
+        }
+
+        let maxConcurrent = adjustedConcurrency
 
         // Pre-compute filenames (on main actor) to avoid calling buildFilename from background tasks
         let filenames = emails.enumerated().map { (index, email) in
@@ -95,23 +108,56 @@ class PDFGenerator {
         // Use TaskGroup for parallel processing
         try await withThrowingTaskGroup(of: Void.self) { group in
             for (index, email) in emails.enumerated() {
-                // Wait for semaphore before starting new task
-                await semaphore.wait()
-
                 let filename = filenames[index]
 
                 group.addTask {
+                    // Wait for semaphore inside the task
+                    await semaphore.wait()
+
+                    // Ensure signal is called when task completes
                     defer {
-                        Task {
-                            await semaphore.signal()
-                        }
+                        semaphore.signal()
                     }
 
                     do {
                         let fileURL = outputDirectory.appendingPathComponent(filename)
 
+                        // Add debugging for the problematic email range
+                        if index >= 435 && index <= 450 {
+                            print("🔍 Processing PDF #\(index + 1): \(email.subject.prefix(50))")
+                            print("   Email body length: \(email.body.count) chars")
+                        }
+
+                        // Handle extremely large emails that could cause memory issues
+                        let maxPDFContentSize = 1_000_000 // 1MB limit for PDF content
+                        var processedEmail = email
+
+                        if email.body.count > maxPDFContentSize {
+                            print("⚠️ PDF #\(index + 1) content too large (\(email.body.count) chars), truncating to \(maxPDFContentSize)")
+
+                            // Create truncated email for PDF generation
+                            let truncatedBody = String(email.body.prefix(maxPDFContentSize))
+                            let truncationNotice = "\n\n" + String(repeating: "=", count: 50) + "\n"
+                            let truncationMessage = "[CONTENT TRUNCATED FOR PDF - Original size: \(String(format: "%.1f", Double(email.body.count) / 1_000_000))MB]\n"
+                            let finalNotice = "[Truncated \(String(format: "%.1f", Double(email.body.count - maxPDFContentSize) / 1_000_000))MB of content]\n"
+                            let endNotice = String(repeating: "=", count: 50)
+
+                            processedEmail = Email(
+                                index: email.index,
+                                subject: email.subject,
+                                from: email.from,
+                                to: email.to,
+                                cc: email.cc,
+                                date: email.date,
+                                dateString: email.dateString,
+                                body: truncatedBody + truncationNotice + truncationMessage + finalNotice + endNotice,
+                                attachments: email.attachments,
+                                sourceFile: email.sourceFile
+                            )
+                        }
+
                         let pdfDocument = PDFDocument()
-                        if let page = await createPage(for: email, pageNumber: 1, totalPages: 1) {
+                        if let page = await createPage(for: processedEmail, pageNumber: 1, totalPages: 1) {
                             pdfDocument.insert(page, at: 0)
                         }
 
@@ -124,7 +170,19 @@ class PDFGenerator {
 
                         // Update progress
                         await progressTracker.increment()
+
+                        if index >= 435 && index <= 450 {
+                            print("✅ Completed PDF #\(index + 1)")
+                        }
+
+                        // Yield control every 25 PDFs for better responsiveness with large content
+                        if index % 25 == 0 {
+                            await Task.yield()
+                        }
                     } catch {
+                        if index >= 435 && index <= 450 {
+                            print("❌ Failed PDF #\(index + 1): \(error)")
+                        }
                         await resultStore.addError(error)
                         await progressTracker.increment()
                     }
@@ -177,11 +235,17 @@ class PDFGenerator {
             }
         }
 
-        func signal() {
-            if let waiter = waiters.first {
-                waiters.removeFirst()
+        nonisolated func signal() {
+            Task {
+                await self._signal()
+            }
+        }
+
+        private func _signal() {
+            if !waiters.isEmpty {
+                let waiter = waiters.removeFirst()
                 waiter.resume()
-            } else {
+            } else if count > 0 {
                 count -= 1
             }
         }
@@ -221,40 +285,92 @@ class PDFGenerator {
             NSColor.white.setFill()
             dirtyRect.fill()
 
-            // Draw the attributed string in the content rect
-            content.draw(in: contentRect)
+            // Calculate the required size for the content
+            let boundingSize = CGSize(width: contentRect.width, height: CGFloat.greatestFiniteMagnitude)
+            let requiredRect = content.boundingRect(with: boundingSize, options: [.usesLineFragmentOrigin, .usesFontLeading])
+
+            // If content is too long for the page, show truncation warning
+            if requiredRect.height > contentRect.height {
+                // Draw as much content as fits
+                content.draw(in: contentRect)
+
+                // Add truncation warning at bottom
+                let warningFont = NSFont.systemFont(ofSize: 8)
+                let warningAttributes: [NSAttributedString.Key: Any] = [
+                    .font: warningFont,
+                    .foregroundColor: NSColor.red,
+                    .backgroundColor: NSColor.white
+                ]
+
+                let excessHeight = requiredRect.height - contentRect.height
+                let warningText = "⚠️ CONTENT TRUNCATED - \(Int(excessHeight)) points of content not shown"
+                let warning = NSAttributedString(string: warningText, attributes: warningAttributes)
+
+                let warningRect = CGRect(
+                    x: contentRect.minX,
+                    y: contentRect.minY + 5, // Small margin from bottom
+                    width: contentRect.width,
+                    height: 20
+                )
+
+                warning.draw(in: warningRect)
+            } else {
+                // Content fits, draw normally
+                content.draw(in: contentRect)
+            }
         }
     }
 
     private static func createPage(for email: Email, pageNumber: Int, totalPages: Int) async -> PDFPage? {
-        // Create an NSAttributedString for the content
-        let content = createAttributedContent(for: email, pageNumber: pageNumber, totalPages: totalPages)
+        // Add timeout protection for very large content
+        return await withTaskGroup(of: PDFPage?.self) { group in
+            group.addTask {
+                // Create an NSAttributedString for the content
+                let content = createAttributedContent(for: email, pageNumber: pageNumber, totalPages: totalPages)
 
-        // Page dimensions (US Letter)
-        let pageRect = CGRect(x: 0, y: 0, width: 612, height: 792) // 8.5" x 11" at 72 DPI
-        let margin: CGFloat = 54 // 0.75" margins
-        let contentRect = CGRect(
-            x: margin,
-            y: margin,
-            width: pageRect.width - (2 * margin),
-            height: pageRect.height - (2 * margin)
-        )
+                // Page dimensions (US Letter)
+                let pageRect = CGRect(x: 0, y: 0, width: 612, height: 792) // 8.5" x 11" at 72 DPI
+                let margin: CGFloat = 54 // 0.75" margins
+                let contentRect = CGRect(
+                    x: margin,
+                    y: margin,
+                    width: pageRect.width - (2 * margin),
+                    height: pageRect.height - (2 * margin)
+                )
 
-        // NSView operations must run on main thread
-        return await MainActor.run {
-            // Create a custom view to render the content
-            let view = EmailContentView(frame: pageRect, content: content, contentRect: contentRect)
+                // NSView operations must run on main thread
+                return await MainActor.run {
+                    autoreleasepool {
+                        // Create a custom view to render the content
+                        let view = EmailContentView(frame: pageRect, content: content, contentRect: contentRect)
 
-            // Create PDF data using the view
-            let pdfData = view.dataWithPDF(inside: pageRect)
+                        // Create PDF data using the view
+                        let pdfData = view.dataWithPDF(inside: pageRect)
 
-            // Create PDFPage from the rendered data
-            guard let pdfDoc = PDFDocument(data: pdfData),
-                  let pdfPage = pdfDoc.page(at: 0) else {
+                        // Create PDFPage from the rendered data
+                        guard let pdfDoc = PDFDocument(data: pdfData),
+                              let pdfPage = pdfDoc.page(at: 0) else {
+                            return nil
+                        }
+
+                        return pdfPage
+                    }
+                }
+            }
+
+            // Add timeout task
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 30_000_000_000) // 30 second timeout
                 return nil
             }
 
-            return pdfPage
+            // Return first completed result (either success or timeout)
+            for await result in group {
+                group.cancelAll()
+                return result
+            }
+
+            return nil
         }
     }
 
