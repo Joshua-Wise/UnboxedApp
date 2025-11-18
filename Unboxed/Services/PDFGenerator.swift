@@ -55,17 +55,23 @@ class PDFGenerator {
         }
     }
 
-    static func generateSinglePDF(emails: [Email], outputURL: URL) async throws {
+    static func generateSinglePDF(emails: [Email], outputURL: URL, settings: AppSettings) async throws {
         let pdfDocument = PDFDocument()
 
         for (index, email) in emails.enumerated() {
-            if let page = await createPage(for: email, pageNumber: index + 1, totalPages: emails.count) {
+            if let page = await createPage(for: email, pageNumber: index + 1, totalPages: emails.count, settings: settings) {
                 pdfDocument.insert(page, at: pdfDocument.pageCount)
             }
         }
 
         guard pdfDocument.write(to: outputURL) else {
             throw GeneratorError.saveFailed("Could not write to \(outputURL.path)")
+        }
+
+        // Handle non-text attachments bundling
+        if settings.bundleNonTextAttachments {
+            let attachmentsZipURL = outputURL.deletingPathExtension().appendingPathExtension("attachments.zip")
+            try saveNonTextAttachments(from: emails, to: attachmentsZipURL)
         }
     }
 
@@ -152,12 +158,13 @@ class PDFGenerator {
                                 dateString: email.dateString,
                                 body: truncatedBody + truncationNotice + truncationMessage + finalNotice + endNotice,
                                 attachments: email.attachments,
+                                attachmentData: email.attachmentData,
                                 sourceFile: email.sourceFile
                             )
                         }
 
                         let pdfDocument = PDFDocument()
-                        if let page = await createPage(for: processedEmail, pageNumber: 1, totalPages: 1) {
+                        if let page = await createPage(for: processedEmail, pageNumber: 1, totalPages: 1, settings: settings) {
                             pdfDocument.insert(page, at: 0)
                         }
 
@@ -198,6 +205,12 @@ class PDFGenerator {
 
         // Report completion
         await progressCallback?(1.0, "Generated \(pdfURLs.count) PDFs")
+
+        // Handle non-text attachments bundling for separate PDFs mode
+        if settings.bundleNonTextAttachments {
+            let attachmentsZipURL = outputDirectory.appendingPathComponent("attachments.zip")
+            try saveNonTextAttachments(from: emails, to: attachmentsZipURL)
+        }
 
         // If there were errors but some succeeded, throw error with details
         if !errors.isEmpty {
@@ -321,12 +334,12 @@ class PDFGenerator {
         }
     }
 
-    private static func createPage(for email: Email, pageNumber: Int, totalPages: Int) async -> PDFPage? {
+    private static func createPage(for email: Email, pageNumber: Int, totalPages: Int, settings: AppSettings) async -> PDFPage? {
         // Add timeout protection for very large content
         return await withTaskGroup(of: PDFPage?.self) { group in
             group.addTask {
                 // Create an NSAttributedString for the content
-                let content = createAttributedContent(for: email, pageNumber: pageNumber, totalPages: totalPages)
+                let content = createAttributedContent(for: email, pageNumber: pageNumber, totalPages: totalPages, settings: settings)
 
                 // Page dimensions (US Letter)
                 let pageRect = CGRect(x: 0, y: 0, width: 612, height: 792) // 8.5" x 11" at 72 DPI
@@ -374,7 +387,7 @@ class PDFGenerator {
         }
     }
 
-    nonisolated private static func createAttributedContent(for email: Email, pageNumber: Int, totalPages: Int) -> NSAttributedString {
+    nonisolated private static func createAttributedContent(for email: Email, pageNumber: Int, totalPages: Int, settings: AppSettings) -> NSAttributedString {
         let content = NSMutableAttributedString()
 
         // Title style
@@ -442,7 +455,104 @@ class PDFGenerator {
         let body = email.body.isEmpty ? "(No content)" : email.body
         content.append(NSAttributedString(string: body + "\n", attributes: bodyAttributes))
 
+        // Add merged attachments if enabled
+        if settings.mergeAttachmentsIntoPDF, let attachments = email.attachmentData {
+            let mergeableAttachments = attachments.filter { $0.canMergeIntoPDF }
+            if !mergeableAttachments.isEmpty {
+                content.append(NSAttributedString(string: "\n" + String(repeating: "─", count: 50) + "\n", attributes: headerAttributes))
+                content.append(NSAttributedString(string: "ATTACHMENTS\n\n", attributes: titleAttributes))
+
+                for attachment in mergeableAttachments {
+                    content.append(NSAttributedString(string: "\n[\(attachment.filename)]\n", attributes: headerAttributes))
+
+                    if attachment.isImage {
+                        // Add image
+                        if let image = NSImage(data: attachment.data) {
+                            // Resize image to fit in page width
+                            let maxWidth: CGFloat = 504 // Page width minus margins
+                            let maxHeight: CGFloat = 300 // Reasonable max height
+                            let imageSize = image.size
+                            var targetSize = imageSize
+
+                            if imageSize.width > maxWidth {
+                                let ratio = maxWidth / imageSize.width
+                                targetSize = CGSize(width: maxWidth, height: imageSize.height * ratio)
+                            }
+
+                            if targetSize.height > maxHeight {
+                                let ratio = maxHeight / targetSize.height
+                                targetSize = CGSize(width: targetSize.width * ratio, height: maxHeight)
+                            }
+
+                            let textAttachment = NSTextAttachment()
+                            textAttachment.image = image
+                            textAttachment.bounds = CGRect(x: 0, y: 0, width: targetSize.width, height: targetSize.height)
+
+                            content.append(NSAttributedString(attachment: textAttachment))
+                            content.append(NSAttributedString(string: "\n\n", attributes: bodyAttributes))
+                        }
+                    } else if attachment.isText {
+                        // Add text content
+                        if let text = String(data: attachment.data, encoding: .utf8) {
+                            let truncatedText = text.count > 5000 ? String(text.prefix(5000)) + "\n...[truncated]" : text
+                            content.append(NSAttributedString(string: truncatedText + "\n\n", attributes: bodyAttributes))
+                        }
+                    }
+                }
+            }
+        }
+
         return content
+    }
+
+    static func saveNonTextAttachments(from emails: [Email], to outputURL: URL) throws {
+        // Collect all non-text attachments
+        var attachmentFiles: [URL] = []
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+
+        defer {
+            // Clean up temp directory
+            try? FileManager.default.removeItem(at: tempDir)
+        }
+
+        do {
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+
+            for email in emails {
+                guard let attachments = email.attachmentData else { continue }
+
+                let nonTextAttachments = attachments.filter { !$0.canMergeIntoPDF }
+
+                for (index, attachment) in nonTextAttachments.enumerated() {
+                    // Create unique filename to avoid collisions
+                    var filename = attachment.filename
+                    let emailPrefix = "email_\(email.index)_"
+
+                    // Check if filename already has the prefix to avoid duplication
+                    if !filename.hasPrefix(emailPrefix) {
+                        filename = emailPrefix + filename
+                    }
+
+                    // If there are multiple attachments with same name in same email
+                    if nonTextAttachments.filter({ $0.filename == attachment.filename }).count > 1 {
+                        let fileExtension = (filename as NSString).pathExtension
+                        let fileNameWithoutExt = (filename as NSString).deletingPathExtension
+                        filename = "\(fileNameWithoutExt)_\(index + 1).\(fileExtension)"
+                    }
+
+                    let fileURL = tempDir.appendingPathComponent(filename)
+                    try attachment.data.write(to: fileURL)
+                    attachmentFiles.append(fileURL)
+                }
+            }
+
+            // Only create ZIP if there are attachments
+            if !attachmentFiles.isEmpty {
+                try createZIPArchive(pdfURLs: attachmentFiles, outputURL: outputURL)
+            }
+        } catch {
+            throw GeneratorError.saveFailed("Failed to save attachments: \(error.localizedDescription)")
+        }
     }
 
     static func createZIPArchive(pdfURLs: [URL], outputURL: URL) throws {

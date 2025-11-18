@@ -29,6 +29,21 @@ struct GeneralSettingsView: View {
                     .help("After parsing, show a preview window to search, filter, and select specific emails before conversion")
             }
 
+            Section("Attachment Handling") {
+                Toggle("Merge Text/Image Attachments into PDF", isOn: $settings.mergeAttachmentsIntoPDF)
+                    .help("When enabled, text and image attachments will be embedded directly into the PDF document")
+
+                Toggle("Bundle Non-Text Attachments", isOn: $settings.bundleNonTextAttachments)
+                    .help("When enabled, creates an attachments.zip file containing all non-text/image attachments (e.g., documents, archives, executables)")
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Note: Attachments are extracted from MIME multipart email messages.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
             Section {
                 VStack(alignment: .leading, spacing: 12) {
                     HStack {
@@ -199,6 +214,7 @@ struct GeneralSettingsView: View {
             dateString: "2024-01-15 10:30:00",
             body: "",
             attachments: [],
+            attachmentData: nil,
             sourceFile: "sample"
         )
 

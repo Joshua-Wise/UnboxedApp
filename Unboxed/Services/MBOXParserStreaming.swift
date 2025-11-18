@@ -414,6 +414,10 @@ class MBOXParserStreaming {
         let to = headers["to"].map { decodeHeader($0) } ?? ""
         let cc = headers["cc"].map { decodeHeader($0) }
 
+        // Extract attachments
+        let attachmentData = AttachmentHandler.extractAttachments(rawBody: rawBody, headers: headers)
+        let attachmentNames = attachmentData.map { $0.filename }
+
         let email = Email(
             index: index,
             subject: subject,
@@ -423,7 +427,8 @@ class MBOXParserStreaming {
             date: parsedDate,
             dateString: dateString,
             body: body,
-            attachments: [],
+            attachments: attachmentNames,
+            attachmentData: attachmentData.isEmpty ? nil : attachmentData,
             sourceFile: sourceFile
         )
 

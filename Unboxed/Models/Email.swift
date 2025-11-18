@@ -7,6 +7,24 @@
 
 import Foundation
 
+struct EmailAttachment: Codable {
+    var filename: String
+    var mimeType: String
+    var data: Data
+
+    var isText: Bool {
+        mimeType.hasPrefix("text/")
+    }
+
+    var isImage: Bool {
+        mimeType.hasPrefix("image/")
+    }
+
+    var canMergeIntoPDF: Bool {
+        isText || isImage
+    }
+}
+
 struct Email: Identifiable, Codable {
     let id = UUID()
     var index: Int
@@ -17,11 +35,12 @@ struct Email: Identifiable, Codable {
     var date: Date?
     var dateString: String
     var body: String
-    var attachments: [String]
+    var attachments: [String]  // Legacy: just filenames for display
+    var attachmentData: [EmailAttachment]?  // New: actual attachment data
     var sourceFile: String
 
     enum CodingKeys: String, CodingKey {
-        case index, subject, from, to, cc, date, dateString, body, attachments, sourceFile
+        case index, subject, from, to, cc, date, dateString, body, attachments, attachmentData, sourceFile
     }
 }
 

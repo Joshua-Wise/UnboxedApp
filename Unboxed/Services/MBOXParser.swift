@@ -213,6 +213,10 @@ class MBOXParser {
             parsedDate = parseDate(dateString)
         }
 
+        // Extract attachments
+        let attachmentData = AttachmentHandler.extractAttachments(rawBody: rawBody, headers: headers)
+        let attachmentNames = attachmentData.map { $0.filename }
+
         // Create email object
         return Email(
             index: index,
@@ -223,7 +227,8 @@ class MBOXParser {
             date: parsedDate,
             dateString: dateString,
             body: body,
-            attachments: [], // TODO: Parse attachments if needed
+            attachments: attachmentNames,
+            attachmentData: attachmentData.isEmpty ? nil : attachmentData,
             sourceFile: sourceFile
         )
     }
