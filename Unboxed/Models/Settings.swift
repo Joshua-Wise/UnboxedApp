@@ -60,9 +60,9 @@ class AppSettings: ObservableObject {
         let previewExists = UserDefaults.standard.object(forKey: "showEmailPreview") != nil
         self.showEmailPreview = previewExists ? UserDefaults.standard.bool(forKey: "showEmailPreview") : true
 
-        // Default to 2MB if not set
+        // Default to 50MB if not set (increased from 2MB to effectively remove truncation for most emails)
         let savedSize = UserDefaults.standard.integer(forKey: "maxEmailBodySizeMB")
-        self.maxEmailBodySizeMB = savedSize > 0 ? savedSize : 2
+        self.maxEmailBodySizeMB = savedSize > 0 ? savedSize : 50
 
         // Default to 4 concurrent PDFs if not set
         let savedConcurrency = UserDefaults.standard.integer(forKey: "maxConcurrentPDFs")

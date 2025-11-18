@@ -135,7 +135,8 @@ class PDFGenerator {
                         }
 
                         // Handle extremely large emails that could cause memory issues
-                        let maxPDFContentSize = 1_000_000 // 1MB limit for PDF content
+                        // Increased to 25MB to effectively remove truncation for most emails
+                        let maxPDFContentSize = 25_000_000 // 25MB limit for PDF content
                         var processedEmail = email
 
                         if email.body.count > maxPDFContentSize {

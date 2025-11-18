@@ -468,26 +468,56 @@ class MBOXParser {
             ]
 
             if let attributedString = try? NSAttributedString(data: data, options: options, documentAttributes: nil) {
-                return attributedString.string
+                let result = attributedString.string
+                // Still clean up excessive whitespace from attributed string conversion
+                var cleaned = result.replacingOccurrences(of: "\n\n\n+", with: "\n\n", options: .regularExpression)
+                cleaned = cleaned.replacingOccurrences(of: "[ \t]+", with: " ", options: .regularExpression)
+                return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
             }
         }
 
-        // Fallback: Manual HTML tag stripping
+        // Fallback: Manual HTML tag stripping with enhanced cleaning
         var text = html
 
+        // Remove script and style tags entirely (including their content)
+        if let scriptRegex = try? NSRegularExpression(pattern: "<script[^>]*>.*?</script>", options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+            text = scriptRegex.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: "")
+        }
+        if let styleRegex = try? NSRegularExpression(pattern: "<style[^>]*>.*?</style>", options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+            text = styleRegex.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: "")
+        }
+
         // Add newlines for block elements before removing tags
-        let blockElements = ["</p>", "</div>", "</br>", "<br>", "<br/>", "<br />", "</h1>", "</h2>", "</h3>", "</h4>", "</h5>", "</h6>", "</li>", "</tr>"]
+        let blockElements = [
+            "</p>", "</div>", "</br>", "<br>", "<br/>", "<br />",
+            "</h1>", "</h2>", "</h3>", "</h4>", "</h5>", "</h6>",
+            "</li>", "</tr>", "</td>", "</th>", "</blockquote>",
+            "</pre>", "</ul>", "</ol>", "</dl>", "</dd>", "</dt>",
+            "</header>", "</footer>", "</section>", "</article>", "</nav>",
+            "</address>", "</fieldset>", "</form>"
+        ]
         for tag in blockElements {
             text = text.replacingOccurrences(of: tag, with: "\n", options: .caseInsensitive)
         }
 
-        // Remove all HTML tags
+        // Add special formatting for list items
+        text = text.replacingOccurrences(of: "<li>", with: "\n• ", options: .caseInsensitive)
+        text = text.replacingOccurrences(of: "<li ", with: "\n• <li ", options: .caseInsensitive)
+
+        // Add spacing for table cells
+        text = text.replacingOccurrences(of: "<td>", with: " ", options: .caseInsensitive)
+        text = text.replacingOccurrences(of: "<td ", with: " <td ", options: .caseInsensitive)
+        text = text.replacingOccurrences(of: "<th>", with: " ", options: .caseInsensitive)
+        text = text.replacingOccurrences(of: "<th ", with: " <th ", options: .caseInsensitive)
+
+        // Remove all remaining HTML tags
         if let regex = try? NSRegularExpression(pattern: "<[^>]+>", options: []) {
             text = regex.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: "")
         }
 
-        // Decode common HTML entities
+        // Decode comprehensive HTML entities
         let entities: [String: String] = [
+            // Common entities
             "&nbsp;": " ",
             "&lt;": "<",
             "&gt;": ">",
@@ -495,11 +525,73 @@ class MBOXParser {
             "&quot;": "\"",
             "&apos;": "'",
             "&#39;": "'",
+
+            // Punctuation
             "&ndash;": "–",
             "&mdash;": "—",
+            "&hellip;": "…",
+            "&lsquo;": "'",
+            "&rsquo;": "'",
+            "&ldquo;": """,
+            "&rdquo;": """,
+            "&laquo;": "«",
+            "&raquo;": "»",
+            "&bull;": "•",
+            "&middot;": "·",
+
+            // Symbols
             "&copy;": "©",
             "&reg;": "®",
-            "&trade;": "™"
+            "&trade;": "™",
+            "&euro;": "€",
+            "&pound;": "£",
+            "&yen;": "¥",
+            "&cent;": "¢",
+            "&sect;": "§",
+            "&para;": "¶",
+            "&deg;": "°",
+            "&plusmn;": "±",
+            "&times;": "×",
+            "&divide;": "÷",
+            "&frac12;": "½",
+            "&frac14;": "¼",
+            "&frac34;": "¾",
+
+            // Arrows
+            "&larr;": "←",
+            "&uarr;": "↑",
+            "&rarr;": "→",
+            "&darr;": "↓",
+            "&harr;": "↔",
+
+            // Math
+            "&ne;": "≠",
+            "&le;": "≤",
+            "&ge;": "≥",
+            "&infin;": "∞",
+            "&sum;": "∑",
+            "&prod;": "∏",
+            "&minus;": "−",
+
+            // Accented characters
+            "&Agrave;": "À", "&Aacute;": "Á", "&Acirc;": "Â", "&Atilde;": "Ã", "&Auml;": "Ä", "&Aring;": "Å",
+            "&agrave;": "à", "&aacute;": "á", "&acirc;": "â", "&atilde;": "ã", "&auml;": "ä", "&aring;": "å",
+            "&Egrave;": "È", "&Eacute;": "É", "&Ecirc;": "Ê", "&Euml;": "Ë",
+            "&egrave;": "è", "&eacute;": "é", "&ecirc;": "ê", "&euml;": "ë",
+            "&Igrave;": "Ì", "&Iacute;": "Í", "&Icirc;": "Î", "&Iuml;": "Ï",
+            "&igrave;": "ì", "&iacute;": "í", "&icirc;": "î", "&iuml;": "ï",
+            "&Ograve;": "Ò", "&Oacute;": "Ó", "&Ocirc;": "Ô", "&Otilde;": "Õ", "&Ouml;": "Ö", "&Oslash;": "Ø",
+            "&ograve;": "ò", "&oacute;": "ó", "&ocirc;": "ô", "&otilde;": "õ", "&ouml;": "ö", "&oslash;": "ø",
+            "&Ugrave;": "Ù", "&Uacute;": "Ú", "&Ucirc;": "Û", "&Uuml;": "Ü",
+            "&ugrave;": "ù", "&uacute;": "ú", "&ucirc;": "û", "&uuml;": "ü",
+            "&Ccedil;": "Ç", "&ccedil;": "ç",
+            "&Ntilde;": "Ñ", "&ntilde;": "ñ",
+            "&Yacute;": "Ý", "&yacute;": "ý", "&yuml;": "ÿ",
+            "&AElig;": "Æ", "&aelig;": "æ",
+            "&OElig;": "Œ", "&oelig;": "œ",
+            "&szlig;": "ß",
+            "&ETH;": "Ð", "&eth;": "ð",
+            "&THORN;": "Þ", "&thorn;": "þ"
         ]
 
         for (entity, replacement) in entities {
@@ -535,6 +627,8 @@ class MBOXParser {
         // Clean up excessive whitespace
         text = text.replacingOccurrences(of: "\n\n\n+", with: "\n\n", options: .regularExpression)
         text = text.replacingOccurrences(of: "[ \t]+", with: " ", options: .regularExpression)
+        text = text.replacingOccurrences(of: " \n", with: "\n", options: .regularExpression)
+        text = text.replacingOccurrences(of: "\n ", with: "\n", options: .regularExpression)
 
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
