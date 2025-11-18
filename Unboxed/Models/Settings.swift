@@ -41,6 +41,18 @@ class AppSettings: ObservableObject {
         }
     }
 
+    @Published var mergeAttachmentsIntoPDF: Bool {
+        didSet {
+            UserDefaults.standard.set(mergeAttachmentsIntoPDF, forKey: "mergeAttachmentsIntoPDF")
+        }
+    }
+
+    @Published var bundleNonTextAttachments: Bool {
+        didSet {
+            UserDefaults.standard.set(bundleNonTextAttachments, forKey: "bundleNonTextAttachments")
+        }
+    }
+
     init() {
         self.separatePDFs = UserDefaults.standard.bool(forKey: "separatePDFs")
 
@@ -67,6 +79,10 @@ class AppSettings: ObservableObject {
                 NamingComponent(type: .sender, enabled: false)
             ]
         }
+
+        // Default to false if not set (opt-in for attachment features)
+        self.mergeAttachmentsIntoPDF = UserDefaults.standard.bool(forKey: "mergeAttachmentsIntoPDF")
+        self.bundleNonTextAttachments = UserDefaults.standard.bool(forKey: "bundleNonTextAttachments")
     }
 
     var maxEmailBodySizeBytes: Int {
