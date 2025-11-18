@@ -80,11 +80,6 @@ class MBOXParserStreaming {
         var bytesRead: Int64 = 0
         let chunkSize = 1024 * 1024 // 1MB chunks
 
-        // Batch processing for parallel email parsing
-        var messageBatch: [(String, Int)] = [] // (messageText, index)
-        let batchSize = 25 // Process emails in batches for better performance
-        let maxConcurrency = min(4, ProcessInfo.processInfo.processorCount) // Limit based on CPU cores
-
         await progressCallback(0.01, "Reading MBOX file...")
 
         // Read file in chunks
@@ -130,26 +125,25 @@ class MBOXParserStreaming {
             for line in lines.dropLast() {
                 // Check for message boundary "From " at start of line
                 if line.starts(with: "From ") && !currentMessage.isEmpty {
-                    // Add message to batch for parallel processing
+                    // Process the current message immediately
                     emailIndex += 1
-                    messageBatch.append((currentMessage, emailIndex))
+                    let result = parseEmail(
+                        messageText: currentMessage,
+                        index: emailIndex,
+                        sourceFile: sourceFileName,
+                        maxBodySizeBytes: maxBodySizeBytes
+                    )
 
-                    // Process batch when it reaches batchSize
-                    if messageBatch.count >= batchSize {
-                        let (batchEmails, batchSkipped) = await processBatch(
-                            messageBatch,
-                            sourceFileName: sourceFileName,
-                            maxBodySizeBytes: maxBodySizeBytes,
-                            maxConcurrency: maxConcurrency
-                        )
-                        emails.append(contentsOf: batchEmails)
-                        skippedEmails.append(contentsOf: batchSkipped)
-                        messageBatch.removeAll()
-
-                        // Progress update
-                        let progress = Double(bytesRead) / Double(fileSize)
-                        await progressCallback(progress * 0.8, "Parsed \(emailIndex) emails...")
+                    switch result {
+                    case .success(let email):
+                        emails.append(email)
+                    case .skipped(let reason):
+                        skippedEmails.append(SkippedEmail(index: emailIndex, reason: reason))
                     }
+
+                    // Progress update
+                    let progress = Double(bytesRead) / Double(fileSize)
+                    await progressCallback(progress * 0.8, "Parsed \(emailIndex) emails...")
 
                     // Start new message
                     currentMessage = line + "\n"
@@ -167,19 +161,19 @@ class MBOXParserStreaming {
         // Process last message
         if !currentMessage.isEmpty {
             emailIndex += 1
-            messageBatch.append((currentMessage, emailIndex))
-        }
-
-        // Process any remaining messages in the final batch
-        if !messageBatch.isEmpty {
-            let (batchEmails, batchSkipped) = await processBatch(
-                messageBatch,
-                sourceFileName: sourceFileName,
-                maxBodySizeBytes: maxBodySizeBytes,
-                maxConcurrency: maxConcurrency
+            let result = parseEmail(
+                messageText: currentMessage,
+                index: emailIndex,
+                sourceFile: sourceFileName,
+                maxBodySizeBytes: maxBodySizeBytes
             )
-            emails.append(contentsOf: batchEmails)
-            skippedEmails.append(contentsOf: batchSkipped)
+
+            switch result {
+            case .success(let email):
+                emails.append(email)
+            case .skipped(let reason):
+                skippedEmails.append(SkippedEmail(index: emailIndex, reason: reason))
+            }
         }
 
         guard !emails.isEmpty else {
@@ -205,92 +199,6 @@ class MBOXParserStreaming {
         }
 
         return result
-    }
-
-    // Process a batch of messages in parallel for better performance
-    private static func processBatch(
-        _ messageBatch: [(String, Int)],
-        sourceFileName: String,
-        maxBodySizeBytes: Int,
-        maxConcurrency: Int
-    ) async -> ([Email], [SkippedEmail]) {
-        var emails: [Email] = []
-        var skippedEmails: [SkippedEmail] = []
-
-        // Use TaskGroup for parallel email parsing
-        await withTaskGroup(of: (Int, ParseEmailResult).self) { group in
-            let semaphore = BatchSemaphore(maxCount: maxConcurrency)
-
-            for (messageText, index) in messageBatch {
-                await semaphore.wait()
-
-                group.addTask {
-                    defer {
-                        Task { await semaphore.signal() }
-                    }
-
-                    let result = parseEmail(
-                        messageText: messageText,
-                        index: index,
-                        sourceFile: sourceFileName,
-                        maxBodySizeBytes: maxBodySizeBytes
-                    )
-                    return (index, result)
-                }
-            }
-
-            // Collect results maintaining order
-            var results: [(Int, ParseEmailResult)] = []
-            for await result in group {
-                results.append(result)
-            }
-
-            // Sort by index to maintain email order
-            results.sort { $0.0 < $1.0 }
-
-            // Process results in order
-            for (_, result) in results {
-                switch result {
-                case .success(let email):
-                    emails.append(email)
-                case .skipped(let reason):
-                    skippedEmails.append(SkippedEmail(index: emails.count + skippedEmails.count + 1, reason: reason))
-                }
-            }
-        }
-
-        return (emails, skippedEmails)
-    }
-
-    // Simple semaphore for batch processing
-    private actor BatchSemaphore {
-        private var count = 0
-        private let maxCount: Int
-        private var waiters: [CheckedContinuation<Void, Never>] = []
-
-        init(maxCount: Int) {
-            self.maxCount = maxCount
-        }
-
-        func wait() async {
-            if count < maxCount {
-                count += 1
-                return
-            }
-
-            await withCheckedContinuation { continuation in
-                waiters.append(continuation)
-            }
-        }
-
-        func signal() {
-            if let waiter = waiters.first {
-                waiters.removeFirst()
-                waiter.resume()
-            } else {
-                count -= 1
-            }
-        }
     }
 
     enum ParseEmailResult {
