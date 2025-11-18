@@ -595,7 +595,9 @@ class MBOXParserStreaming {
                 let partBodyLines = Array(partLines[partBodyStartIndex...])
                 let partBody = partBodyLines.joined(separator: "\n")
                 let encoding = partHeaders["content-transfer-encoding"] ?? ""
-                return decodeBody(partBody.trimmingCharacters(in: .whitespacesAndNewlines), encoding: encoding)
+                let decodedHTML = decodeBody(partBody.trimmingCharacters(in: .whitespacesAndNewlines), encoding: encoding)
+                // Convert HTML to plain text
+                return convertHTMLToPlainText(decodedHTML)
             }
         }
 
@@ -644,5 +646,85 @@ class MBOXParserStreaming {
         }
 
         return result
+    }
+
+    private static func convertHTMLToPlainText(_ html: String) -> String {
+        // Try to use NSAttributedString for HTML parsing (macOS native approach)
+        if let data = html.data(using: .utf8) {
+            let options: [NSAttributedString.DocumentReadingOptionKey: Any] = [
+                .documentType: NSAttributedString.DocumentType.html,
+                .characterEncoding: String.Encoding.utf8.rawValue
+            ]
+
+            if let attributedString = try? NSAttributedString(data: data, options: options, documentAttributes: nil) {
+                return attributedString.string
+            }
+        }
+
+        // Fallback: Manual HTML tag stripping
+        var text = html
+
+        // Add newlines for block elements before removing tags
+        let blockElements = ["</p>", "</div>", "</br>", "<br>", "<br/>", "<br />", "</h1>", "</h2>", "</h3>", "</h4>", "</h5>", "</h6>", "</li>", "</tr>"]
+        for tag in blockElements {
+            text = text.replacingOccurrences(of: tag, with: "\n", options: .caseInsensitive)
+        }
+
+        // Remove all HTML tags
+        if let regex = try? NSRegularExpression(pattern: "<[^>]+>", options: []) {
+            text = regex.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: "")
+        }
+
+        // Decode common HTML entities
+        let entities: [String: String] = [
+            "&nbsp;": " ",
+            "&lt;": "<",
+            "&gt;": ">",
+            "&amp;": "&",
+            "&quot;": "\"",
+            "&apos;": "'",
+            "&#39;": "'",
+            "&ndash;": "–",
+            "&mdash;": "—",
+            "&copy;": "©",
+            "&reg;": "®",
+            "&trade;": "™"
+        ]
+
+        for (entity, replacement) in entities {
+            text = text.replacingOccurrences(of: entity, with: replacement, options: .caseInsensitive)
+        }
+
+        // Decode numeric HTML entities (&#123; or &#xAB;)
+        if let numericRegex = try? NSRegularExpression(pattern: "&#(\\d+);", options: []) {
+            let matches = numericRegex.matches(in: text, range: NSRange(text.startIndex..., in: text))
+            for match in matches.reversed() {
+                if let range = Range(match.range, in: text),
+                   let numberRange = Range(match.range(at: 1), in: text),
+                   let code = Int(text[numberRange]),
+                   let scalar = UnicodeScalar(code) {
+                    text.replaceSubrange(range, with: String(Character(scalar)))
+                }
+            }
+        }
+
+        // Decode hex HTML entities (&#xAB;)
+        if let hexRegex = try? NSRegularExpression(pattern: "&#x([0-9A-Fa-f]+);", options: []) {
+            let matches = hexRegex.matches(in: text, range: NSRange(text.startIndex..., in: text))
+            for match in matches.reversed() {
+                if let range = Range(match.range, in: text),
+                   let hexRange = Range(match.range(at: 1), in: text),
+                   let code = Int(text[hexRange], radix: 16),
+                   let scalar = UnicodeScalar(code) {
+                    text.replaceSubrange(range, with: String(Character(scalar)))
+                }
+            }
+        }
+
+        // Clean up excessive whitespace
+        text = text.replacingOccurrences(of: "\n\n\n+", with: "\n\n", options: .regularExpression)
+        text = text.replacingOccurrences(of: "[ \t]+", with: " ", options: .regularExpression)
+
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
