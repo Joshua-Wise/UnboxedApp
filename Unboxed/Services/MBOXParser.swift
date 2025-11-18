@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import AppKit
 
 class MBOXParser {
     enum ParserError: LocalizedError {

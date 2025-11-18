@@ -88,14 +88,12 @@ class AttachmentHandler {
         }
 
         // Extract filename
-        var filename = extractFilename(from: contentDisposition) ?? extractFilename(from: contentType)
+        let filename = extractFilename(from: contentDisposition) ?? extractFilename(from: contentType)
 
         // If no filename found but has content type, skip (likely inline content)
-        guard let foundFilename = filename else {
+        guard let filename = filename else {
             return nil
         }
-
-        filename = foundFilename
 
         // Extract MIME type
         var mimeType = contentType

@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import AppKit
 
 class MBOXParserStreaming {
     enum ParserError: LocalizedError {
@@ -323,7 +324,7 @@ class MBOXParserStreaming {
         let cc = headers["cc"].map { decodeHeader($0) }
 
         // Extract attachments
-        let attachmentData = AttachmentHandler.extractAttachments(rawBody: rawBody, headers: headers)
+        let attachmentData = AttachmentHandler.extractAttachments(rawBody: rawBodyText, headers: headers)
         let attachmentNames = attachmentData.map { $0.filename }
 
         let email = Email(
