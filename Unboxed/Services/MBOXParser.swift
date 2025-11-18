@@ -330,6 +330,13 @@ class MBOXParser {
 
         // Single part email - check for encoding
         let result = decodeBody(rawBody.trimmingCharacters(in: .whitespacesAndNewlines), encoding: encoding)
+        
+        // Check if it's HTML and convert to plain text
+        if contentType.lowercased().contains("text/html") {
+            print("   → Converting single-part HTML to plain text")
+            return convertHTMLToPlainText(result)
+        }
+        
         return result
     }
 
@@ -352,7 +359,10 @@ class MBOXParser {
 
         // Look for text/plain or text/html parts
         for part in parts {
-            guard !part.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            let trimmedPart = part.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedPart.isEmpty else { continue }
+            // Skip boundary markers (parts that start with --)
+            guard !trimmedPart.hasPrefix("--") else { continue }
 
             let partLines = part.components(separatedBy: "\n")
             var partHeaders: [String: String] = [:]
@@ -375,15 +385,24 @@ class MBOXParser {
             // Prefer text/plain, fall back to text/html
             if partContentType.contains("text/plain") {
                 let partBodyLines = Array(partLines[partBodyStartIndex...])
-                let partBody = partBodyLines.joined(separator: "\n")
+                var partBody = partBodyLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                
+                // Remove any trailing MIME boundary markers
+                if let lastBoundaryIndex = partBody.range(of: "--\(boundary)", options: .backwards) {
+                    partBody = String(partBody[..<lastBoundaryIndex.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                
                 let encoding = partHeaders["content-transfer-encoding"] ?? ""
-                return decodeBody(partBody.trimmingCharacters(in: .whitespacesAndNewlines), encoding: encoding)
+                return decodeBody(partBody, encoding: encoding)
             }
         }
 
         // If no text/plain found, look for text/html
         for part in parts {
-            guard !part.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            let trimmedPart = part.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedPart.isEmpty else { continue }
+            // Skip boundary markers (parts that start with --)
+            guard !trimmedPart.hasPrefix("--") else { continue }
 
             let partLines = part.components(separatedBy: "\n")
             var partHeaders: [String: String] = [:]
@@ -404,9 +423,15 @@ class MBOXParser {
 
             if partContentType.contains("text/html") {
                 let partBodyLines = Array(partLines[partBodyStartIndex...])
-                let partBody = partBodyLines.joined(separator: "\n")
+                var partBody = partBodyLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                
+                // Remove any trailing MIME boundary markers
+                if let lastBoundaryIndex = partBody.range(of: "--\(boundary)", options: .backwards) {
+                    partBody = String(partBody[..<lastBoundaryIndex.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                
                 let encoding = partHeaders["content-transfer-encoding"] ?? ""
-                let decodedHTML = decodeBody(partBody.trimmingCharacters(in: .whitespacesAndNewlines), encoding: encoding)
+                let decodedHTML = decodeBody(partBody, encoding: encoding)
                 // Convert HTML to plain text
                 return convertHTMLToPlainText(decodedHTML)
             }
@@ -462,12 +487,19 @@ class MBOXParser {
     private static func convertHTMLToPlainText(_ html: String) -> String {
         // Try to use NSAttributedString for HTML parsing (macOS native approach)
         if let data = html.data(using: .utf8) {
+            // Prepend charset meta tag to ensure proper UTF-8 interpretation
+            let htmlWithCharset = "<meta charset=\"utf-8\">\(html)"
+            guard let dataWithCharset = htmlWithCharset.data(using: .utf8) else {
+                // Fallback to original data if charset addition fails
+                return convertHTMLManually(html)
+            }
+            
             let options: [NSAttributedString.DocumentReadingOptionKey: Any] = [
                 .documentType: NSAttributedString.DocumentType.html,
                 .characterEncoding: String.Encoding.utf8.rawValue
             ]
 
-            if let attributedString = try? NSAttributedString(data: data, options: options, documentAttributes: nil) {
+            if let attributedString = try? NSAttributedString(data: dataWithCharset, options: options, documentAttributes: nil) {
                 let result = attributedString.string
                 // Still clean up excessive whitespace from attributed string conversion
                 var cleaned = result.replacingOccurrences(of: "\n\n\n+", with: "\n\n", options: .regularExpression)
@@ -475,8 +507,11 @@ class MBOXParser {
                 return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
             }
         }
-
-        // Fallback: Manual HTML tag stripping with enhanced cleaning
+        
+        return convertHTMLManually(html)
+    }
+    
+    private static func convertHTMLManually(_ html: String) -> String {
         var text = html
 
         // Remove script and style tags entirely (including their content)
@@ -532,8 +567,8 @@ class MBOXParser {
             "&hellip;": "…",
             "&lsquo;": "'",
             "&rsquo;": "'",
-            "&ldquo;": """,
-            "&rdquo;": """,
+            "&ldquo;": "\u{201C}",
+            "&rdquo;": "\u{201D}",
             "&laquo;": "«",
             "&raquo;": "»",
             "&bull;": "•",
