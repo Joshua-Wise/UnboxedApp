@@ -331,10 +331,10 @@ class MBOXParser {
         // Single part email - check for encoding
         let result = decodeBody(rawBody.trimmingCharacters(in: .whitespacesAndNewlines), encoding: encoding)
         
-        // Check if it's HTML and convert to plain text
+        // For HTML content, keep it as-is so PDF generator can render it properly
+        // Don't convert to plain text - let the renderer handle it
         if contentType.lowercased().contains("text/html") {
-            print("   → Converting single-part HTML to plain text")
-            return convertHTMLToPlainText(result)
+            print("   → Preserving HTML for rendering")
         }
         
         return result
@@ -387,8 +387,8 @@ class MBOXParser {
                 let partBodyLines = Array(partLines[partBodyStartIndex...])
                 var partBody = partBodyLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
                 
-                // Remove any trailing MIME boundary markers
-                if let lastBoundaryIndex = partBody.range(of: "--\(boundary)", options: .backwards) {
+                // Remove any trailing MIME boundary markers (both --boundary and --boundary--)
+                while let lastBoundaryIndex = partBody.range(of: "--\(boundary)", options: .backwards) {
                     partBody = String(partBody[..<lastBoundaryIndex.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
                 }
                 
@@ -425,15 +425,17 @@ class MBOXParser {
                 let partBodyLines = Array(partLines[partBodyStartIndex...])
                 var partBody = partBodyLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
                 
-                // Remove any trailing MIME boundary markers
-                if let lastBoundaryIndex = partBody.range(of: "--\(boundary)", options: .backwards) {
+                // Remove any trailing MIME boundary markers (both --boundary and --boundary--)
+                while let lastBoundaryIndex = partBody.range(of: "--\(boundary)", options: .backwards) {
                     partBody = String(partBody[..<lastBoundaryIndex.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
                 }
                 
                 let encoding = partHeaders["content-transfer-encoding"] ?? ""
                 let decodedHTML = decodeBody(partBody, encoding: encoding)
-                // Convert HTML to plain text
-                return convertHTMLToPlainText(decodedHTML)
+                
+                // Keep HTML as-is for PDF rendering, don't convert to plain text
+                print("   → Preserving multipart HTML for rendering")
+                return decodedHTML
             }
         }
 
@@ -486,7 +488,7 @@ class MBOXParser {
 
     private static func convertHTMLToPlainText(_ html: String) -> String {
         // Try to use NSAttributedString for HTML parsing (macOS native approach)
-        if let data = html.data(using: .utf8) {
+        if html.data(using: .utf8) != nil {
             // Prepend charset meta tag to ensure proper UTF-8 interpretation
             let htmlWithCharset = "<meta charset=\"utf-8\">\(html)"
             guard let dataWithCharset = htmlWithCharset.data(using: .utf8) else {

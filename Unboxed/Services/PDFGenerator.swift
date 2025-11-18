@@ -59,7 +59,11 @@ class PDFGenerator {
         let pdfDocument = PDFDocument()
 
         for (index, email) in emails.enumerated() {
-            if let page = await createPage(for: email, pageNumber: index + 1, totalPages: emails.count, settings: settings) {
+            // Create pages for this email (may be multiple pages for long content)
+            let pages = await MainActor.run {
+                createPages(for: email, emailNumber: index + 1, totalEmails: emails.count, settings: settings)
+            }
+            for page in pages {
                 pdfDocument.insert(page, at: pdfDocument.pageCount)
             }
         }
@@ -134,39 +138,16 @@ class PDFGenerator {
                             print("   Email body length: \(email.body.count) chars")
                         }
 
-                        // Handle extremely large emails that could cause memory issues
-                        // Increased to 25MB to effectively remove truncation for most emails
-                        let maxPDFContentSize = 25_000_000 // 25MB limit for PDF content
-                        var processedEmail = email
-
-                        if email.body.count > maxPDFContentSize {
-                            print("⚠️ PDF #\(index + 1) content too large (\(email.body.count) chars), truncating to \(maxPDFContentSize)")
-
-                            // Create truncated email for PDF generation
-                            let truncatedBody = String(email.body.prefix(maxPDFContentSize))
-                            let truncationNotice = "\n\n" + String(repeating: "=", count: 50) + "\n"
-                            let truncationMessage = "[CONTENT TRUNCATED FOR PDF - Original size: \(String(format: "%.1f", Double(email.body.count) / 1_000_000))MB]\n"
-                            let finalNotice = "[Truncated \(String(format: "%.1f", Double(email.body.count - maxPDFContentSize) / 1_000_000))MB of content]\n"
-                            let endNotice = String(repeating: "=", count: 50)
-
-                            processedEmail = Email(
-                                index: email.index,
-                                subject: email.subject,
-                                from: email.from,
-                                to: email.to,
-                                cc: email.cc,
-                                date: email.date,
-                                dateString: email.dateString,
-                                body: truncatedBody + truncationNotice + truncationMessage + finalNotice + endNotice,
-                                attachments: email.attachments,
-                                attachmentData: email.attachmentData,
-                                sourceFile: email.sourceFile
-                            )
-                        }
+                        // With multi-page support, we no longer need to pre-truncate content
+                        // The pagination will handle long emails by creating multiple pages
 
                         let pdfDocument = PDFDocument()
-                        if let page = await createPage(for: processedEmail, pageNumber: 1, totalPages: 1, settings: settings) {
-                            pdfDocument.insert(page, at: 0)
+                        // Create pages for this email (may be multiple pages for long content)
+                        let pages = await MainActor.run {
+                            createPages(for: email, emailNumber: 1, totalEmails: 1, settings: settings)
+                        }
+                        for (pageIndex, page) in pages.enumerated() {
+                            pdfDocument.insert(page, at: pageIndex)
                         }
 
                         guard pdfDocument.write(to: fileURL) else {
@@ -279,19 +260,30 @@ class PDFGenerator {
         }
     }
 
-    // Custom view for rendering email content to PDF
+    // Custom view for rendering email content to PDF (single page or portion)
     private class EmailContentView: NSView {
         private let content: NSAttributedString
         private let contentRect: CGRect
+        private let characterRange: NSRange
+        private let showPageFooter: Bool
+        private let pageInfo: String?
 
-        init(frame: NSRect, content: NSAttributedString, contentRect: CGRect) {
+        init(frame: NSRect, content: NSAttributedString, contentRect: CGRect, characterRange: NSRange, showPageFooter: Bool = false, pageInfo: String? = nil) {
             self.content = content
             self.contentRect = contentRect
+            self.characterRange = characterRange
+            self.showPageFooter = showPageFooter
+            self.pageInfo = pageInfo
             super.init(frame: frame)
         }
 
         required init?(coder: NSCoder) {
             fatalError("init(coder:) has not been implemented")
+        }
+        
+        // Use flipped coordinate system (origin at top-left)
+        override var isFlipped: Bool {
+            return true
         }
 
         override func draw(_ dirtyRect: NSRect) {
@@ -299,96 +291,162 @@ class PDFGenerator {
             NSColor.white.setFill()
             dirtyRect.fill()
 
-            // Calculate the required size for the content
-            let boundingSize = CGSize(width: contentRect.width, height: CGFloat.greatestFiniteMagnitude)
-            let requiredRect = content.boundingRect(with: boundingSize, options: [.usesLineFragmentOrigin, .usesFontLeading])
-
-            // If content is too long for the page, show truncation warning
-            if requiredRect.height > contentRect.height {
-                // Draw as much content as fits
-                content.draw(in: contentRect)
-
-                // Add truncation warning at bottom
-                let warningFont = NSFont.systemFont(ofSize: 8)
-                let warningAttributes: [NSAttributedString.Key: Any] = [
-                    .font: warningFont,
-                    .foregroundColor: NSColor.red,
-                    .backgroundColor: NSColor.white
+            // Use NSLayoutManager for proper text layout and rendering
+            let textStorage = NSTextStorage(attributedString: content)
+            let layoutManager = NSLayoutManager()
+            textStorage.addLayoutManager(layoutManager)
+            
+            let textContainer = NSTextContainer(size: CGSize(width: contentRect.width, height: CGFloat.greatestFiniteMagnitude))
+            textContainer.lineFragmentPadding = 0
+            layoutManager.addTextContainer(textContainer)
+            
+            // Force layout
+            layoutManager.glyphRange(for: textContainer)
+            
+            // Draw only the specified character range
+            let glyphRange = layoutManager.glyphRange(forCharacterRange: characterRange, actualCharacterRange: nil)
+            let boundingRect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+            
+            // Calculate offset to position content correctly at the top of the page
+            let yOffset = contentRect.minY - boundingRect.minY
+            
+            layoutManager.drawGlyphs(forGlyphRange: glyphRange, at: CGPoint(x: contentRect.minX, y: yOffset))
+            
+            // Draw page footer if requested
+            if showPageFooter, let pageInfo = pageInfo {
+                let footerFont = NSFont.systemFont(ofSize: 8)
+                let footerAttributes: [NSAttributedString.Key: Any] = [
+                    .font: footerFont,
+                    .foregroundColor: NSColor.gray
                 ]
-
-                let excessHeight = requiredRect.height - contentRect.height
-                let warningText = "⚠️ CONTENT TRUNCATED - \(Int(excessHeight)) points of content not shown"
-                let warning = NSAttributedString(string: warningText, attributes: warningAttributes)
-
-                let warningRect = CGRect(
+                let footerText = NSAttributedString(string: pageInfo, attributes: footerAttributes)
+                let footerRect = CGRect(
                     x: contentRect.minX,
-                    y: contentRect.minY + 5, // Small margin from bottom
+                    y: bounds.height - 35, // Position near bottom
                     width: contentRect.width,
-                    height: 20
+                    height: 15
                 )
-
-                warning.draw(in: warningRect)
-            } else {
-                // Content fits, draw normally
-                content.draw(in: contentRect)
+                footerText.draw(in: footerRect)
             }
         }
     }
 
-    private static func createPage(for email: Email, pageNumber: Int, totalPages: Int, settings: AppSettings) async -> PDFPage? {
-        // Add timeout protection for very large content
-        return await withTaskGroup(of: PDFPage?.self) { group in
-            group.addTask {
-                // Create an NSAttributedString for the content
-                let content = createAttributedContent(for: email, pageNumber: pageNumber, totalPages: totalPages, settings: settings)
-
-                // Page dimensions (US Letter)
-                let pageRect = CGRect(x: 0, y: 0, width: 612, height: 792) // 8.5" x 11" at 72 DPI
-                let margin: CGFloat = 54 // 0.75" margins
-                let contentRect = CGRect(
-                    x: margin,
-                    y: margin,
-                    width: pageRect.width - (2 * margin),
-                    height: pageRect.height - (2 * margin)
-                )
-
-                // NSView operations must run on main thread
-                return await MainActor.run {
-                    autoreleasepool {
-                        // Create a custom view to render the content
-                        let view = EmailContentView(frame: pageRect, content: content, contentRect: contentRect)
-
-                        // Create PDF data using the view
-                        let pdfData = view.dataWithPDF(inside: pageRect)
-
-                        // Create PDFPage from the rendered data
-                        guard let pdfDoc = PDFDocument(data: pdfData),
-                              let pdfPage = pdfDoc.page(at: 0) else {
-                            return nil
-                        }
-
-                        return pdfPage
-                    }
+    @MainActor
+    private static func createPages(for email: Email, emailNumber: Int, totalEmails: Int, settings: AppSettings) -> [PDFPage] {
+        // Create attributed content
+        let content = createAttributedContent(for: email, pageNumber: emailNumber, totalPages: totalEmails, settings: settings)
+        
+        // Page dimensions (US Letter)
+        let pageRect = CGRect(x: 0, y: 0, width: 612, height: 792) // 8.5" x 11" at 72 DPI
+        let margin: CGFloat = 54 // 0.75" margins
+        let contentRect = CGRect(
+            x: margin,
+            y: margin,
+            width: pageRect.width - (2 * margin),
+            height: pageRect.height - (2 * margin)
+        )
+        
+        // Use NSLayoutManager to calculate pagination
+        let textStorage = NSTextStorage(attributedString: content)
+        let layoutManager = NSLayoutManager()
+        textStorage.addLayoutManager(layoutManager)
+        
+        let textContainer = NSTextContainer(size: CGSize(width: contentRect.width, height: CGFloat.greatestFiniteMagnitude))
+        textContainer.lineFragmentPadding = 0
+        layoutManager.addTextContainer(textContainer)
+        
+        // Force layout to calculate glyph positions
+        _ = layoutManager.glyphRange(for: textContainer)
+        
+        // Calculate character ranges for each page
+        var pages: [PDFPage] = []
+        var currentCharIndex = 0
+        var pageNumber = 1
+        
+        while currentCharIndex < content.length {
+            let isFirstPage = (pageNumber == 1)
+            let availableHeight = isFirstPage ? contentRect.height : (contentRect.height - 30) // Reserve space for footer
+            
+            // Binary search to find the right character range that fits in availableHeight
+            var low = currentCharIndex
+            var high = content.length
+            var bestFit = currentCharIndex
+            
+            while low < high {
+                let mid = (low + high + 1) / 2
+                let testRange = NSRange(location: currentCharIndex, length: mid - currentCharIndex)
+                let glyphRange = layoutManager.glyphRange(forCharacterRange: testRange, actualCharacterRange: nil)
+                let boundingRect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+                
+                if boundingRect.height <= availableHeight {
+                    bestFit = mid
+                    low = mid
+                } else {
+                    high = mid - 1
                 }
             }
-
-            // Add timeout task
-            group.addTask {
-                try? await Task.sleep(nanoseconds: 30_000_000_000) // 30 second timeout
+            
+            // If no progress, force at least some characters (prevent infinite loop)
+            if bestFit == currentCharIndex {
+                bestFit = min(currentCharIndex + 100, content.length)
+            }
+            
+            let pageCharacterRange = NSRange(location: currentCharIndex, length: bestFit - currentCharIndex)
+            
+            // Calculate total pages for footer
+            let remainingChars = content.length - bestFit
+            let estimatedRemainingPages = remainingChars > 0 ? Int(ceil(Double(remainingChars) / Double(pageCharacterRange.length))) : 0
+            let totalPagesNeeded = pageNumber + estimatedRemainingPages
+            
+            let pageInfo = isFirstPage ? nil : "Page \(pageNumber) of \(totalPagesNeeded)"
+            
+            if let page = createSinglePage(
+                content: content,
+                pageRect: pageRect,
+                contentRect: contentRect,
+                characterRange: pageCharacterRange,
+                pageInfo: pageInfo
+            ) {
+                pages.append(page)
+            }
+            
+            currentCharIndex = bestFit
+            pageNumber += 1
+            
+            // Safety limit
+            if pageNumber > 1000 {
+                print("⚠️ Reached page limit for email #\(emailNumber), stopping pagination")
+                break
+            }
+        }
+        
+        return pages
+    }
+    
+    @MainActor
+    private static func createSinglePage(content: NSAttributedString, pageRect: CGRect, contentRect: CGRect, characterRange: NSRange, pageInfo: String?) -> PDFPage? {
+        return autoreleasepool {
+            let view = EmailContentView(
+                frame: pageRect,
+                content: content,
+                contentRect: contentRect,
+                characterRange: characterRange,
+                showPageFooter: pageInfo != nil,
+                pageInfo: pageInfo
+            )
+            
+            let pdfData = view.dataWithPDF(inside: pageRect)
+            
+            guard let pdfDoc = PDFDocument(data: pdfData),
+                  let pdfPage = pdfDoc.page(at: 0) else {
                 return nil
             }
-
-            // Return first completed result (either success or timeout)
-            for await result in group {
-                group.cancelAll()
-                return result
-            }
-
-            return nil
+            
+            return pdfPage
         }
     }
 
-    nonisolated private static func createAttributedContent(for email: Email, pageNumber: Int, totalPages: Int, settings: AppSettings) -> NSAttributedString {
+    @MainActor private static func createAttributedContent(for email: Email, pageNumber: Int, totalPages: Int, settings: AppSettings) -> NSAttributedString {
         let content = NSMutableAttributedString()
 
         // Title style
@@ -453,8 +511,17 @@ class PDFGenerator {
 
         // Add body
         content.append(NSAttributedString(string: "Message:\n", attributes: headerAttributes))
-        let body = email.body.isEmpty ? "(No content)" : email.body
-        content.append(NSAttributedString(string: body + "\n", attributes: bodyAttributes))
+        
+        if email.body.isEmpty {
+            content.append(NSAttributedString(string: "(No content)\n", attributes: bodyAttributes))
+        } else if isHTMLContent(email.body), let htmlAttributedString = createHTMLAttributedString(from: email.body) {
+            // Successfully rendered as HTML with formatting preserved
+            content.append(htmlAttributedString)
+            content.append(NSAttributedString(string: "\n", attributes: bodyAttributes))
+        } else {
+            // Fallback to plain text
+            content.append(NSAttributedString(string: email.body + "\n", attributes: bodyAttributes))
+        }
 
         // Add merged attachments if enabled
         if settings.mergeAttachmentsIntoPDF, let attachments = email.attachmentData {
@@ -504,6 +571,150 @@ class PDFGenerator {
         }
 
         return content
+    }
+    
+    nonisolated private static func isHTMLContent(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        // Check for common HTML patterns
+        let htmlPatterns = [
+            "<html", "<body", "<div", "<table", "<tr", "<td", "<th",
+            "<p>", "<br>", "<br/>", "<span", "<a ", "<img", "<h1", "<h2", "<h3",
+            "<ul", "<ol", "<li", "<strong", "<em", "<b>", "<i>", "<style"
+        ]
+        
+        let lowercased = trimmed.lowercased()
+        
+        // If it starts with common HTML tags, it's definitely HTML
+        if lowercased.hasPrefix("<!doctype html") || lowercased.hasPrefix("<html") {
+            return true
+        }
+        
+        // Check if it contains multiple HTML tags (not just one or two)
+        let tagCount = htmlPatterns.filter { lowercased.contains($0) }.count
+        return tagCount >= 2
+    }
+    
+    nonisolated private static func createHTMLAttributedString(from html: String) -> NSAttributedString? {
+        // Clean up the HTML first
+        var cleanedHTML = html
+        
+        // Remove any MIME boundary markers that might have slipped through
+        cleanedHTML = cleanedHTML.replacingOccurrences(of: #"--[0-9a-fA-F]{20,}--?"#, with: "", options: .regularExpression)
+        
+        // Remove broken/incomplete HTML tag fragments at the start
+        // Matches things like: tyle="..." or div style="..." without opening <
+        if let regex = try? NSRegularExpression(pattern: "^[a-zA-Z]+=\"[^\"]*\">", options: []) {
+            cleanedHTML = regex.stringByReplacingMatches(in: cleanedHTML, range: NSRange(cleanedHTML.startIndex..., in: cleanedHTML), withTemplate: "")
+        }
+        
+        // Remove broken tag fragments (incomplete opening/closing tags)
+        if let regex = try? NSRegularExpression(pattern: "^[^<]*>", options: []) {
+            let trimmed = cleanedHTML.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.hasPrefix("<") {
+                cleanedHTML = regex.stringByReplacingMatches(in: cleanedHTML, range: NSRange(cleanedHTML.startIndex..., in: cleanedHTML), withTemplate: "")
+            }
+        }
+        
+        cleanedHTML = cleanedHTML.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        // Prepare HTML with proper charset and basic styling
+        let styledHTML = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <style>
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Helvetica, Arial, sans-serif;
+                    font-size: 10pt;
+                    line-height: 1.4;
+                    color: #000000;
+                    margin: 0;
+                    padding: 0;
+                }
+                table {
+                    border-collapse: collapse;
+                    margin: 10px 0;
+                    font-size: 9pt;
+                }
+                td, th {
+                    border: 1px solid #cccccc;
+                    padding: 4px 8px;
+                    vertical-align: top;
+                }
+                th {
+                    background-color: #f0f0f0;
+                    font-weight: bold;
+                }
+                blockquote {
+                    margin: 10px 0;
+                    padding-left: 10px;
+                    border-left: 2px solid #cccccc;
+                    color: #666666;
+                }
+                pre {
+                    background-color: #f5f5f5;
+                    padding: 8px;
+                    border-radius: 3px;
+                    overflow-x: auto;
+                    font-size: 9pt;
+                }
+                code {
+                    background-color: #f5f5f5;
+                    padding: 2px 4px;
+                    border-radius: 3px;
+                    font-family: 'Monaco', 'Courier New', monospace;
+                    font-size: 9pt;
+                }
+                a {
+                    color: #0066cc;
+                    text-decoration: underline;
+                }
+                img {
+                    max-width: 100%;
+                    height: auto;
+                }
+                h1, h2, h3, h4, h5, h6 {
+                    margin: 10px 0 5px 0;
+                    line-height: 1.2;
+                }
+                h1 { font-size: 14pt; }
+                h2 { font-size: 12pt; }
+                h3 { font-size: 11pt; }
+                p {
+                    margin: 5px 0;
+                }
+                ul, ol {
+                    margin: 5px 0;
+                    padding-left: 20px;
+                }
+                li {
+                    margin: 2px 0;
+                }
+            </style>
+        </head>
+        <body>
+        \(cleanedHTML)
+        </body>
+        </html>
+        """
+        
+        guard let data = styledHTML.data(using: .utf8) else {
+            return nil
+        }
+        
+        let options: [NSAttributedString.DocumentReadingOptionKey: Any] = [
+            .documentType: NSAttributedString.DocumentType.html,
+            .characterEncoding: String.Encoding.utf8.rawValue
+        ]
+        
+        // Try to create attributed string from HTML
+        if let attributedString = try? NSAttributedString(data: data, options: options, documentAttributes: nil) {
+            return attributedString
+        }
+        
+        return nil
     }
 
     static func saveNonTextAttachments(from emails: [Email], to outputURL: URL) throws {
