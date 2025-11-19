@@ -330,6 +330,13 @@ class MBOXParser {
 
         // Single part email - check for encoding
         let result = decodeBody(rawBody.trimmingCharacters(in: .whitespacesAndNewlines), encoding: encoding)
+        
+        // For HTML content, keep it as-is so PDF generator can render it properly
+        // Don't convert to plain text - let the renderer handle it
+        if contentType.lowercased().contains("text/html") {
+            print("   → Preserving HTML for rendering")
+        }
+        
         return result
     }
 
@@ -375,15 +382,24 @@ class MBOXParser {
             // Prefer text/plain, fall back to text/html
             if partContentType.contains("text/plain") {
                 let partBodyLines = Array(partLines[partBodyStartIndex...])
-                let partBody = partBodyLines.joined(separator: "\n")
+                var partBody = partBodyLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                
+                // Remove any trailing MIME boundary markers (both --boundary and --boundary--)
+                while let lastBoundaryIndex = partBody.range(of: "--\(boundary)", options: .backwards) {
+                    partBody = String(partBody[..<lastBoundaryIndex.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                
                 let encoding = partHeaders["content-transfer-encoding"] ?? ""
-                return decodeBody(partBody.trimmingCharacters(in: .whitespacesAndNewlines), encoding: encoding)
+                return decodeBody(partBody, encoding: encoding)
             }
         }
 
         // If no text/plain found, look for text/html
         for part in parts {
-            guard !part.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            let trimmedPart = part.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedPart.isEmpty else { continue }
+            // Skip boundary markers (parts that start with --)
+            guard !trimmedPart.hasPrefix("--") else { continue }
 
             let partLines = part.components(separatedBy: "\n")
             var partHeaders: [String: String] = [:]
@@ -404,11 +420,19 @@ class MBOXParser {
 
             if partContentType.contains("text/html") {
                 let partBodyLines = Array(partLines[partBodyStartIndex...])
-                let partBody = partBodyLines.joined(separator: "\n")
+                var partBody = partBodyLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                
+                // Remove any trailing MIME boundary markers (both --boundary and --boundary--)
+                while let lastBoundaryIndex = partBody.range(of: "--\(boundary)", options: .backwards) {
+                    partBody = String(partBody[..<lastBoundaryIndex.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                
                 let encoding = partHeaders["content-transfer-encoding"] ?? ""
-                let decodedHTML = decodeBody(partBody.trimmingCharacters(in: .whitespacesAndNewlines), encoding: encoding)
-                // Convert HTML to plain text
-                return convertHTMLToPlainText(decodedHTML)
+                let decodedHTML = decodeBody(partBody, encoding: encoding)
+                
+                // Keep HTML as-is for PDF rendering, don't convert to plain text
+                print("   → Preserving multipart HTML for rendering")
+                return decodedHTML
             }
         }
 

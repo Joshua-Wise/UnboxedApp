@@ -321,13 +321,136 @@ struct EmailPreviewView: View {
                 Divider()
 
                 // Body
-                Text(email.body)
-                    .font(.body)
+                EmailBodyView(body: email.body)
                     .textSelection(.enabled)
             }
             .padding()
         }
         .frame(minWidth: 400)
         .background(Color(NSColor.controlBackgroundColor))
+    }
+}
+
+// Helper view to render email body (HTML or plain text)
+struct EmailBodyView: NSViewRepresentable {
+    let body: String
+    
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        let textView = NSTextView()
+        
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.backgroundColor = .clear
+        textView.drawsBackground = false
+        textView.textContainerInset = NSSize(width: 0, height: 0)
+        
+        scrollView.documentView = textView
+        scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
+        scrollView.drawsBackground = false
+        
+        return scrollView
+    }
+    
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = scrollView.documentView as? NSTextView else { return }
+        
+        // Try to render as HTML first
+        if isHTMLContent(body), let attributedString = createHTMLAttributedString(from: body) {
+            textView.textStorage?.setAttributedString(attributedString)
+        } else {
+            // Fallback to plain text
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 13),
+                .foregroundColor: NSColor.textColor
+            ]
+            let plainText = NSAttributedString(string: body, attributes: attributes)
+            textView.textStorage?.setAttributedString(plainText)
+        }
+    }
+    
+    private func isHTMLContent(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let htmlPatterns = [
+            "<html", "<body", "<div", "<table", "<tr", "<td",
+            "<p>", "<br>", "<span", "<h1", "<h2", "<h3"
+        ]
+        
+        let lowercased = trimmed.lowercased()
+        if lowercased.hasPrefix("<!doctype html") || lowercased.hasPrefix("<html") {
+            return true
+        }
+        
+        let tagCount = htmlPatterns.filter { lowercased.contains($0) }.count
+        return tagCount >= 2
+    }
+    
+    private func createHTMLAttributedString(from html: String) -> NSAttributedString? {
+        // Clean up the HTML first
+        var cleanedHTML = html
+        
+        // Remove any MIME boundary markers
+        cleanedHTML = cleanedHTML.replacingOccurrences(of: #"--[0-9a-fA-F]{20,}--?"#, with: "", options: .regularExpression)
+        
+        // Remove broken/incomplete HTML tag fragments at the start
+        if let regex = try? NSRegularExpression(pattern: "^[a-zA-Z]+=\"[^\"]*\">", options: []) {
+            cleanedHTML = regex.stringByReplacingMatches(in: cleanedHTML, range: NSRange(cleanedHTML.startIndex..., in: cleanedHTML), withTemplate: "")
+        }
+        
+        // Remove broken tag fragments
+        if let regex = try? NSRegularExpression(pattern: "^[^<]*>", options: []) {
+            let trimmed = cleanedHTML.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.hasPrefix("<") {
+                cleanedHTML = regex.stringByReplacingMatches(in: cleanedHTML, range: NSRange(cleanedHTML.startIndex..., in: cleanedHTML), withTemplate: "")
+            }
+        }
+        
+        cleanedHTML = cleanedHTML.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        let styledHTML = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <style>
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Helvetica, Arial, sans-serif;
+                    font-size: 13pt;
+                    line-height: 1.4;
+                    color: #000000;
+                }
+                table {
+                    border-collapse: collapse;
+                    margin: 10px 0;
+                }
+                td, th {
+                    border: 1px solid #cccccc;
+                    padding: 6px 10px;
+                }
+                th {
+                    background-color: #f0f0f0;
+                    font-weight: bold;
+                }
+                a {
+                    color: #0066cc;
+                    text-decoration: underline;
+                }
+            </style>
+        </head>
+        <body>
+        \(cleanedHTML)
+        </body>
+        </html>
+        """
+        
+        guard let data = styledHTML.data(using: .utf8) else { return nil }
+        
+        let options: [NSAttributedString.DocumentReadingOptionKey: Any] = [
+            .documentType: NSAttributedString.DocumentType.html,
+            .characterEncoding: String.Encoding.utf8.rawValue
+        ]
+        
+        return try? NSAttributedString(data: data, options: options, documentAttributes: nil)
     }
 }
