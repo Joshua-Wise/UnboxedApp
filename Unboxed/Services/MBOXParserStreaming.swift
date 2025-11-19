@@ -54,7 +54,7 @@ class MBOXParserStreaming {
         fileURL: URL,
         progressCallback: @escaping ProgressCallback,
         shouldCancel: @escaping () -> Bool,
-        maxBodySizeBytes: Int = 2_000_000
+        maxBodySizeBytes: Int = 50_000_000  // Increased to 50MB default, effectively removing truncation for most emails
     ) async throws -> ParseResult {
         guard fileURL.pathExtension.lowercased() == "mbox" || fileURL.pathExtension.lowercased() == "mbx" else {
             throw ParserError.invalidFile
@@ -296,13 +296,16 @@ class MBOXParserStreaming {
 
         var body: String
 
-        if decodedBody.count > maxBodySizeBytes {
+        // Only truncate if body exceeds the limit (now 50MB by default)
+        // This effectively removes truncation for most emails while still preventing memory issues with extremely large content
+        if maxBodySizeBytes > 0 && decodedBody.count > maxBodySizeBytes {
             body = String(decodedBody.prefix(maxBodySizeBytes))
             let truncatedBytes = decodedBody.count - maxBodySizeBytes
             let truncatedMB = Double(truncatedBytes) / 1_000_000
             body += "\n\n" + String(repeating: "=", count: 50)
             body += "\n[CONTENT TRUNCATED - \(String(format: "%.1f", truncatedMB))MB of content not displayed]"
             body += "\n[Original size: \(String(format: "%.1f", Double(decodedBody.count) / 1_000_000))MB]"
+            body += "\n[Note: To see full content, increase maxEmailBodySizeMB in settings]"
             body += "\n" + String(repeating: "=", count: 50)
         } else {
             body = decodedBody
@@ -433,7 +436,12 @@ class MBOXParserStreaming {
         }
 
         // Single part email - check for encoding
-        return decodeBody(rawBody.trimmingCharacters(in: .whitespacesAndNewlines), encoding: encoding)
+        let result = decodeBody(rawBody.trimmingCharacters(in: .whitespacesAndNewlines), encoding: encoding)
+        
+        // For HTML content, keep it as-is so PDF generator can render it properly
+        // Don't convert to plain text - let the renderer handle it
+        
+        return result
     }
 
     private static func extractMultipartBody(rawBody: String, contentType: String) -> String {
@@ -455,7 +463,10 @@ class MBOXParserStreaming {
 
         // Look for text/plain or text/html parts
         for part in parts {
-            guard !part.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            let trimmedPart = part.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedPart.isEmpty else { continue }
+            // Skip boundary markers (parts that start with --)
+            guard !trimmedPart.hasPrefix("--") else { continue }
 
             let partLines = part.components(separatedBy: "\n")
             var partHeaders: [String: String] = [:]
@@ -478,15 +489,24 @@ class MBOXParserStreaming {
             // Prefer text/plain, fall back to text/html
             if partContentType.contains("text/plain") {
                 let partBodyLines = Array(partLines[partBodyStartIndex...])
-                let partBody = partBodyLines.joined(separator: "\n")
+                var partBody = partBodyLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                
+                // Remove any trailing MIME boundary markers (both --boundary and --boundary--)
+                while let lastBoundaryIndex = partBody.range(of: "--\(boundary)", options: .backwards) {
+                    partBody = String(partBody[..<lastBoundaryIndex.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                
                 let encoding = partHeaders["content-transfer-encoding"] ?? ""
-                return decodeBody(partBody.trimmingCharacters(in: .whitespacesAndNewlines), encoding: encoding)
+                return decodeBody(partBody, encoding: encoding)
             }
         }
 
         // If no text/plain found, look for text/html
         for part in parts {
-            guard !part.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            let trimmedPart = part.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedPart.isEmpty else { continue }
+            // Skip boundary markers (parts that start with --)
+            guard !trimmedPart.hasPrefix("--") else { continue }
 
             let partLines = part.components(separatedBy: "\n")
             var partHeaders: [String: String] = [:]
@@ -507,11 +527,18 @@ class MBOXParserStreaming {
 
             if partContentType.contains("text/html") {
                 let partBodyLines = Array(partLines[partBodyStartIndex...])
-                let partBody = partBodyLines.joined(separator: "\n")
+                var partBody = partBodyLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                
+                // Remove any trailing MIME boundary markers (both --boundary and --boundary--)
+                while let lastBoundaryIndex = partBody.range(of: "--\(boundary)", options: .backwards) {
+                    partBody = String(partBody[..<lastBoundaryIndex.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                
                 let encoding = partHeaders["content-transfer-encoding"] ?? ""
-                let decodedHTML = decodeBody(partBody.trimmingCharacters(in: .whitespacesAndNewlines), encoding: encoding)
-                // Convert HTML to plain text
-                return convertHTMLToPlainText(decodedHTML)
+                let decodedHTML = decodeBody(partBody, encoding: encoding)
+                
+                // Keep HTML as-is for PDF rendering, don't convert to plain text
+                return decodedHTML
             }
         }
 
@@ -564,33 +591,73 @@ class MBOXParserStreaming {
 
     private static func convertHTMLToPlainText(_ html: String) -> String {
         // Try to use NSAttributedString for HTML parsing (macOS native approach)
-        if let data = html.data(using: .utf8) {
+        if html.data(using: .utf8) != nil {
+            // Prepend charset meta tag to ensure proper UTF-8 interpretation
+            let htmlWithCharset = "<meta charset=\"utf-8\">\(html)"
+            guard let dataWithCharset = htmlWithCharset.data(using: .utf8) else {
+                // Fallback to original data if charset addition fails
+                return convertHTMLManually(html)
+            }
+            
             let options: [NSAttributedString.DocumentReadingOptionKey: Any] = [
                 .documentType: NSAttributedString.DocumentType.html,
                 .characterEncoding: String.Encoding.utf8.rawValue
             ]
 
-            if let attributedString = try? NSAttributedString(data: data, options: options, documentAttributes: nil) {
-                return attributedString.string
+            if let attributedString = try? NSAttributedString(data: dataWithCharset, options: options, documentAttributes: nil) {
+                let result = attributedString.string
+                // Still clean up excessive whitespace from attributed string conversion
+                var cleaned = result.replacingOccurrences(of: "\n\n\n+", with: "\n\n", options: .regularExpression)
+                cleaned = cleaned.replacingOccurrences(of: "[ \t]+", with: " ", options: .regularExpression)
+                return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
             }
         }
-
-        // Fallback: Manual HTML tag stripping
+        
+        return convertHTMLManually(html)
+    }
+    
+    private static func convertHTMLManually(_ html: String) -> String {
         var text = html
 
+        // Remove script and style tags entirely (including their content)
+        if let scriptRegex = try? NSRegularExpression(pattern: "<script[^>]*>.*?</script>", options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+            text = scriptRegex.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: "")
+        }
+        if let styleRegex = try? NSRegularExpression(pattern: "<style[^>]*>.*?</style>", options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+            text = styleRegex.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: "")
+        }
+
         // Add newlines for block elements before removing tags
-        let blockElements = ["</p>", "</div>", "</br>", "<br>", "<br/>", "<br />", "</h1>", "</h2>", "</h3>", "</h4>", "</h5>", "</h6>", "</li>", "</tr>"]
+        let blockElements = [
+            "</p>", "</div>", "</br>", "<br>", "<br/>", "<br />",
+            "</h1>", "</h2>", "</h3>", "</h4>", "</h5>", "</h6>",
+            "</li>", "</tr>", "</td>", "</th>", "</blockquote>",
+            "</pre>", "</ul>", "</ol>", "</dl>", "</dd>", "</dt>",
+            "</header>", "</footer>", "</section>", "</article>", "</nav>",
+            "</address>", "</fieldset>", "</form>"
+        ]
         for tag in blockElements {
             text = text.replacingOccurrences(of: tag, with: "\n", options: .caseInsensitive)
         }
 
-        // Remove all HTML tags
+        // Add special formatting for list items
+        text = text.replacingOccurrences(of: "<li>", with: "\n• ", options: .caseInsensitive)
+        text = text.replacingOccurrences(of: "<li ", with: "\n• <li ", options: .caseInsensitive)
+
+        // Add spacing for table cells
+        text = text.replacingOccurrences(of: "<td>", with: " ", options: .caseInsensitive)
+        text = text.replacingOccurrences(of: "<td ", with: " <td ", options: .caseInsensitive)
+        text = text.replacingOccurrences(of: "<th>", with: " ", options: .caseInsensitive)
+        text = text.replacingOccurrences(of: "<th ", with: " <th ", options: .caseInsensitive)
+
+        // Remove all remaining HTML tags
         if let regex = try? NSRegularExpression(pattern: "<[^>]+>", options: []) {
             text = regex.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: "")
         }
 
-        // Decode common HTML entities
+        // Decode comprehensive HTML entities
         let entities: [String: String] = [
+            // Common entities
             "&nbsp;": " ",
             "&lt;": "<",
             "&gt;": ">",
@@ -598,11 +665,73 @@ class MBOXParserStreaming {
             "&quot;": "\"",
             "&apos;": "'",
             "&#39;": "'",
+
+            // Punctuation
             "&ndash;": "–",
             "&mdash;": "—",
+            "&hellip;": "…",
+            "&lsquo;": "'",
+            "&rsquo;": "'",
+            "&ldquo;": "\u{201C}",
+            "&rdquo;": "\u{201D}",
+            "&laquo;": "«",
+            "&raquo;": "»",
+            "&bull;": "•",
+            "&middot;": "·",
+
+            // Symbols
             "&copy;": "©",
             "&reg;": "®",
-            "&trade;": "™"
+            "&trade;": "™",
+            "&euro;": "€",
+            "&pound;": "£",
+            "&yen;": "¥",
+            "&cent;": "¢",
+            "&sect;": "§",
+            "&para;": "¶",
+            "&deg;": "°",
+            "&plusmn;": "±",
+            "&times;": "×",
+            "&divide;": "÷",
+            "&frac12;": "½",
+            "&frac14;": "¼",
+            "&frac34;": "¾",
+
+            // Arrows
+            "&larr;": "←",
+            "&uarr;": "↑",
+            "&rarr;": "→",
+            "&darr;": "↓",
+            "&harr;": "↔",
+
+            // Math
+            "&ne;": "≠",
+            "&le;": "≤",
+            "&ge;": "≥",
+            "&infin;": "∞",
+            "&sum;": "∑",
+            "&prod;": "∏",
+            "&minus;": "−",
+
+            // Accented characters
+            "&Agrave;": "À", "&Aacute;": "Á", "&Acirc;": "Â", "&Atilde;": "Ã", "&Auml;": "Ä", "&Aring;": "Å",
+            "&agrave;": "à", "&aacute;": "á", "&acirc;": "â", "&atilde;": "ã", "&auml;": "ä", "&aring;": "å",
+            "&Egrave;": "È", "&Eacute;": "É", "&Ecirc;": "Ê", "&Euml;": "Ë",
+            "&egrave;": "è", "&eacute;": "é", "&ecirc;": "ê", "&euml;": "ë",
+            "&Igrave;": "Ì", "&Iacute;": "Í", "&Icirc;": "Î", "&Iuml;": "Ï",
+            "&igrave;": "ì", "&iacute;": "í", "&icirc;": "î", "&iuml;": "ï",
+            "&Ograve;": "Ò", "&Oacute;": "Ó", "&Ocirc;": "Ô", "&Otilde;": "Õ", "&Ouml;": "Ö", "&Oslash;": "Ø",
+            "&ograve;": "ò", "&oacute;": "ó", "&ocirc;": "ô", "&otilde;": "õ", "&ouml;": "ö", "&oslash;": "ø",
+            "&Ugrave;": "Ù", "&Uacute;": "Ú", "&Ucirc;": "Û", "&Uuml;": "Ü",
+            "&ugrave;": "ù", "&uacute;": "ú", "&ucirc;": "û", "&uuml;": "ü",
+            "&Ccedil;": "Ç", "&ccedil;": "ç",
+            "&Ntilde;": "Ñ", "&ntilde;": "ñ",
+            "&Yacute;": "Ý", "&yacute;": "ý", "&yuml;": "ÿ",
+            "&AElig;": "Æ", "&aelig;": "æ",
+            "&OElig;": "Œ", "&oelig;": "œ",
+            "&szlig;": "ß",
+            "&ETH;": "Ð", "&eth;": "ð",
+            "&THORN;": "Þ", "&thorn;": "þ"
         ]
 
         for (entity, replacement) in entities {
@@ -638,6 +767,8 @@ class MBOXParserStreaming {
         // Clean up excessive whitespace
         text = text.replacingOccurrences(of: "\n\n\n+", with: "\n\n", options: .regularExpression)
         text = text.replacingOccurrences(of: "[ \t]+", with: " ", options: .regularExpression)
+        text = text.replacingOccurrences(of: " \n", with: "\n", options: .regularExpression)
+        text = text.replacingOccurrences(of: "\n ", with: "\n", options: .regularExpression)
 
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
