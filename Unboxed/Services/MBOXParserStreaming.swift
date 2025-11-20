@@ -305,7 +305,7 @@ class MBOXParserStreaming {
             body += "\n\n" + String(repeating: "=", count: 50)
             body += "\n[CONTENT TRUNCATED - \(String(format: "%.1f", truncatedMB))MB of content not displayed]"
             body += "\n[Original size: \(String(format: "%.1f", Double(decodedBody.count) / 1_000_000))MB]"
-            body += "\n[Note: To see full content, increase maxEmailBodySizeMB in settings]"
+            body += "\n[Note: This email is exceptionally large and was truncated during parsing to prevent memory issues]"
             body += "\n" + String(repeating: "=", count: 50)
         } else {
             body = decodedBody

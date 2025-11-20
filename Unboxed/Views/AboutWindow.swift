@@ -20,7 +20,7 @@ struct AboutWindow: View {
                 .font(.largeTitle)
                 .fontWeight(.bold)
 
-            Text("Version 1.0.0")
+            Text("Version 1.1.0")
                 .font(.subheadline)
                 .foregroundColor(.secondary)
 

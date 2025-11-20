@@ -29,18 +29,6 @@ class AppSettings: ObservableObject {
         }
     }
 
-    @Published var maxEmailBodySizeMB: Int {
-        didSet {
-            UserDefaults.standard.set(maxEmailBodySizeMB, forKey: "maxEmailBodySizeMB")
-        }
-    }
-
-    @Published var maxConcurrentPDFs: Int {
-        didSet {
-            UserDefaults.standard.set(maxConcurrentPDFs, forKey: "maxConcurrentPDFs")
-        }
-    }
-
     @Published var mergeAttachmentsIntoPDF: Bool {
         didSet {
             UserDefaults.standard.set(mergeAttachmentsIntoPDF, forKey: "mergeAttachmentsIntoPDF")
@@ -60,14 +48,6 @@ class AppSettings: ObservableObject {
         let previewExists = UserDefaults.standard.object(forKey: "showEmailPreview") != nil
         self.showEmailPreview = previewExists ? UserDefaults.standard.bool(forKey: "showEmailPreview") : true
 
-        // Default to 50MB if not set (increased from 2MB to effectively remove truncation for most emails)
-        let savedSize = UserDefaults.standard.integer(forKey: "maxEmailBodySizeMB")
-        self.maxEmailBodySizeMB = savedSize > 0 ? savedSize : 50
-
-        // Default to 4 concurrent PDFs if not set
-        let savedConcurrency = UserDefaults.standard.integer(forKey: "maxConcurrentPDFs")
-        self.maxConcurrentPDFs = savedConcurrency > 0 ? savedConcurrency : 4
-
         if let data = UserDefaults.standard.data(forKey: "namingComponents"),
            let decoded = try? JSONDecoder().decode([NamingComponent].self, from: data) {
             self.namingComponents = decoded
@@ -83,10 +63,6 @@ class AppSettings: ObservableObject {
         // Default to false if not set (opt-in for attachment features)
         self.mergeAttachmentsIntoPDF = UserDefaults.standard.bool(forKey: "mergeAttachmentsIntoPDF")
         self.bundleNonTextAttachments = UserDefaults.standard.bool(forKey: "bundleNonTextAttachments")
-    }
-
-    var maxEmailBodySizeBytes: Int {
-        return maxEmailBodySizeMB * 1_000_000
     }
 
     func buildFilename(for email: Email, index: Int) -> String {

@@ -24,7 +24,7 @@ struct UnboxedApp: App {
                     NSApplication.shared.orderFrontStandardAboutPanel(
                         options: [
                             NSApplication.AboutPanelOptionKey.applicationName: "Unboxed",
-                            NSApplication.AboutPanelOptionKey.applicationVersion: "1.0.1",
+                            NSApplication.AboutPanelOptionKey.applicationVersion: "1.1.0",
                             NSApplication.AboutPanelOptionKey.version: "",
                             NSApplication.AboutPanelOptionKey.credits: NSAttributedString(
                                 string: "MBOX to PDF Conversion Utility",

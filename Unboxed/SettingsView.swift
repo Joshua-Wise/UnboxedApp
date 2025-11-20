@@ -17,7 +17,6 @@ struct SettingsView: View {
 
 struct GeneralSettingsView: View {
     @ObservedObject var settings: AppSettings
-    @State private var showWarning = false
 
     var body: some View {
         Form {
@@ -42,89 +41,6 @@ struct GeneralSettingsView: View {
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-            }
-
-            Section {
-                VStack(alignment: .leading, spacing: 12) {
-                    HStack {
-                        Text("Concurrent PDF Generation:")
-                            .font(.headline)
-                        Spacer()
-                        Text("\(settings.maxConcurrentPDFs) at a time")
-                            .foregroundColor(.secondary)
-                    }
-
-                    Picker("Concurrency", selection: $settings.maxConcurrentPDFs) {
-                        Text("Sequential (1)").tag(1)
-                        Text("Low (2)").tag(2)
-                        Text("Medium (4)").tag(4)
-                        Text("High (8)").tag(8)
-                        Text("Maximum (16)").tag(16)
-                    }
-                    .pickerStyle(.segmented)
-
-                    Text("Higher concurrency uses more CPU and memory but is faster. Recommended: Medium (4)")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(.vertical, 8)
-
-                Divider()
-
-                VStack(alignment: .leading, spacing: 12) {
-                    HStack {
-                        Text("Maximum Email Body Size:")
-                            .font(.headline)
-                        Spacer()
-                        Text("\(settings.maxEmailBodySizeMB) MB")
-                            .foregroundColor(.secondary)
-                    }
-
-                    Slider(value: Binding(
-                        get: { Double(settings.maxEmailBodySizeMB) },
-                        set: { settings.maxEmailBodySizeMB = Int($0) }
-                    ), in: 1...60, step: 1)
-
-                    HStack(spacing: 4) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundColor(.orange)
-                            .font(.caption)
-                        Text("Large sizes may cause slow rendering or crashes")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-
-                    Text("Email bodies larger than this size will be truncated in exported PDF.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    HStack(spacing: 8) {
-                        Button("Small (5 MB)") {
-                            settings.maxEmailBodySizeMB = 5
-                        }
-                        .buttonStyle(.bordered)
-
-                        Button("Medium (15 MB)") {
-                            settings.maxEmailBodySizeMB = 15
-                        }
-                        .buttonStyle(.bordered)
-
-                        Button("Large (30 MB)") {
-                            settings.maxEmailBodySizeMB = 30
-                        }
-                        .buttonStyle(.bordered)
-
-                        Button("Max (60 MB)") {
-                            settings.maxEmailBodySizeMB = 60
-                            showWarning = true
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                }
-            } header: {
-                Text("Performance")
             }
 
             Section {
@@ -196,11 +112,6 @@ struct GeneralSettingsView: View {
         .formStyle(.grouped)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding()
-        .alert("Warning: High Memory Usage", isPresented: $showWarning) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text("Setting the maximum body size to 60 MB may cause the application to become slow or crash when processing emails with large attachments or content. Use with caution.")
-        }
     }
 
     private func previewFilename() -> String {

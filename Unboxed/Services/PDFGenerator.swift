@@ -85,18 +85,24 @@ class PDFGenerator {
         settings: AppSettings,
         progressCallback: ((Double, String) async -> Void)? = nil
     ) async throws -> [URL] {
+        // Auto-detect optimal concurrency based on system resources and content size
+        let processorCount = ProcessInfo.processInfo.activeProcessorCount
+        let baselineConcurrency = max(2, min(processorCount / 2, 8)) // Use half the cores, max 8
+        
         // Analyze content sizes to adjust concurrency
         let largeEmailCount = emails.filter { $0.body.count > 500_000 }.count
         let hugeEmailCount = emails.filter { $0.body.count > 2_000_000 }.count
 
         // Reduce concurrency for large content to prevent memory issues
-        var adjustedConcurrency = settings.maxConcurrentPDFs
+        var adjustedConcurrency = baselineConcurrency
         if hugeEmailCount > 0 {
             adjustedConcurrency = min(2, adjustedConcurrency) // Max 2 for huge emails
             print("📊 Detected \(hugeEmailCount) huge emails (>2MB), reducing concurrency to \(adjustedConcurrency)")
         } else if largeEmailCount > 5 {
             adjustedConcurrency = min(3, adjustedConcurrency) // Max 3 for many large emails
             print("📊 Detected \(largeEmailCount) large emails (>500KB), reducing concurrency to \(adjustedConcurrency)")
+        } else {
+            print("📊 Using \(adjustedConcurrency) concurrent PDF generators (system has \(processorCount) cores)")
         }
 
         let maxConcurrent = adjustedConcurrency
@@ -132,45 +138,10 @@ class PDFGenerator {
                     do {
                         let fileURL = outputDirectory.appendingPathComponent(filename)
 
-                        // Add debugging for the problematic email range
-                        if index >= 435 && index <= 450 {
-                            print("🔍 Processing PDF #\(index + 1): \(email.subject.prefix(50))")
-                            print("   Email body length: \(email.body.count) chars")
-                        }
-
-                        // Handle extremely large emails that could cause memory issues
-                        let maxPDFContentSize = 1_000_000 // 1MB limit for PDF content
-                        var processedEmail = email
-
-                        if email.body.count > maxPDFContentSize {
-                            print("⚠️ PDF #\(index + 1) content too large (\(email.body.count) chars), truncating to \(maxPDFContentSize)")
-
-                            // Create truncated email for PDF generation
-                            let truncatedBody = String(email.body.prefix(maxPDFContentSize))
-                            let truncationNotice = "\n\n" + String(repeating: "=", count: 50) + "\n"
-                            let truncationMessage = "[CONTENT TRUNCATED FOR PDF - Original size: \(String(format: "%.1f", Double(email.body.count) / 1_000_000))MB]\n"
-                            let finalNotice = "[Truncated \(String(format: "%.1f", Double(email.body.count - maxPDFContentSize) / 1_000_000))MB of content]\n"
-                            let endNotice = String(repeating: "=", count: 50)
-
-                            processedEmail = Email(
-                                index: email.index,
-                                subject: email.subject,
-                                from: email.from,
-                                to: email.to,
-                                cc: email.cc,
-                                date: email.date,
-                                dateString: email.dateString,
-                                body: truncatedBody + truncationNotice + truncationMessage + finalNotice + endNotice,
-                                attachments: email.attachments,
-                                attachmentData: email.attachmentData,
-                                sourceFile: email.sourceFile
-                            )
-                        }
-
+                        // Multi-page pagination handles emails of any size
                         let pdfDocument = PDFDocument()
-                        let emailToProcess = processedEmail  // Copy to avoid capture warning
                         let pages = await MainActor.run {
-                            createPages(for: emailToProcess, emailNumber: 1, totalEmails: 1, settings: settings)
+                            createPages(for: email, emailNumber: 1, totalEmails: 1, settings: settings)
                         }
                         
                         for page in pages {
@@ -187,18 +158,12 @@ class PDFGenerator {
                         // Update progress
                         await progressTracker.increment()
 
-                        if index >= 435 && index <= 450 {
-                            print("✅ Completed PDF #\(index + 1)")
-                        }
-
                         // Yield control every 25 PDFs for better responsiveness with large content
                         if index % 25 == 0 {
                             await Task.yield()
                         }
                     } catch {
-                        if index >= 435 && index <= 450 {
-                            print("❌ Failed PDF #\(index + 1): \(error)")
-                        }
+                        print("❌ Failed to generate PDF for email #\(index + 1): \(error)")
                         await resultStore.addError(error)
                         await progressTracker.increment()
                     }

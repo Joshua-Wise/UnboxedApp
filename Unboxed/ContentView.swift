@@ -323,8 +323,7 @@ struct HomeView: View {
                                 self.statusMessage = "\(fileURL.lastPathComponent): \(message)"
                             }
                         },
-                        shouldCancel: { self.shouldCancelProcessing },
-                        maxBodySizeBytes: settings.maxEmailBodySizeBytes
+                        shouldCancel: { self.shouldCancelProcessing }
                     )
 
                     allEmails.append(contentsOf: parseResult.emails)
