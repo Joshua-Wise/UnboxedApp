@@ -3,7 +3,7 @@
 A native macOS application for converting MBOX email archives to PDF documents. Read more about the application on [my dev blog](https://jwise.dev/posts/unboxing-vaults-mail/).
 
 
-![Unboxed email preview and selection](docs/screenshot.png "Unboxed email preview and selection")
+![Unboxed Screenshot](docs/screenshot.png "Unboxed Screenshot")
 
 ## Features
 
