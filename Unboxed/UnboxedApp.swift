@@ -15,9 +15,12 @@ struct UnboxedApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .frame(minWidth: 800, minHeight: 600)
         }
         .windowStyle(.hiddenTitleBar)
+        // The window can never be smaller than the content's minimum size, so
+        // a previously saved window frame cannot clip the top or bottom bars.
+        .windowResizability(.contentMinSize)
+        .defaultSize(width: 900, height: 640)
         .commands {
             CommandGroup(replacing: .appInfo) {
                 Button("About Unboxed") {

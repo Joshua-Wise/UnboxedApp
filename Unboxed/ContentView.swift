@@ -29,30 +29,15 @@ struct ContentView: View {
                     Label("Settings", systemImage: "gearshape")
                 }
         }
-        .frame(minWidth: 900, minHeight: 700)
+        .frame(minWidth: 720, minHeight: 520)
     }
 }
 
 struct HomeView: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject var historyManager: ConversionHistoryManager
-    @State private var selectedFiles: [URL] = []
-    @State private var isProcessing = false
-    @State private var progress: Double = 0.0
-    @State private var statusMessage = ""
-    @State private var showError = false
-    @State private var errorMessage = ""
-    @State private var showSuccess = false
-    @State private var successMessage = ""
+    @StateObject private var model = ConversionViewModel()
     @State private var isDragging = false
-    @State private var shouldCancelProcessing = false
-    @State private var conversionStartTime: Date?
-    @State private var outputFolderURL: URL?
-    @State private var showEmailPreview = false
-    @State private var parsedEmails: [Email] = []
-    @State private var selectedEmailIndices: Set<Int> = []
-    @State private var emailSearchText = ""
-    @State private var totalSkippedCount = 0
 
     private var appDelegate: AppDelegate? {
         NSApplication.shared.delegate as? AppDelegate
@@ -61,61 +46,55 @@ struct HomeView: View {
     var body: some View {
         VStack(spacing: 0) {
             // Main content
-            if selectedFiles.isEmpty && !isProcessing {
-                uploadView
-            } else if isProcessing {
+            if model.isProcessing {
                 processingView
+            } else if model.selectedFiles.isEmpty {
+                uploadView
             } else {
                 fileListView
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(NSColor.windowBackgroundColor))
-        .alert("Error", isPresented: $showError) {
-            Button("OK") { showError = false }
+        .alert("Error", isPresented: $model.showError) {
+            Button("OK") { model.showError = false }
         } message: {
-            Text(errorMessage)
+            Text(model.errorMessage)
         }
-        .alert("Success", isPresented: $showSuccess) {
-            if let outputURL = outputFolderURL {
+        .alert("Success", isPresented: $model.showSuccess) {
+            if let outputURL = model.outputURL {
                 Button("Open Folder") {
                     NSWorkspace.shared.selectFile(outputURL.path, inFileViewerRootedAtPath: outputURL.deletingLastPathComponent().path)
-                    showSuccess = false
-                    reset()
+                    model.showSuccess = false
+                    model.reset()
                 }
             }
             Button("OK") {
-                showSuccess = false
-                reset()
+                model.showSuccess = false
+                model.reset()
             }
         } message: {
-            Text(successMessage)
+            Text(model.successMessage)
         }
         .onReceive(NotificationCenter.default.publisher(for: .openFilesRequested)) { notification in
             if let urls = notification.object as? [URL] {
                 // Opening from recent files or dock drop
-                for url in urls {
-                    if !selectedFiles.contains(url) {
-                        selectedFiles.append(url)
-                    }
-                }
+                model.addFiles(urls)
             } else {
                 // Opening via menu/keyboard shortcut
                 selectFiles()
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .clearSelection)) { _ in
-            reset()
+            model.reset()
         }
-        .sheet(isPresented: $showEmailPreview) {
+        .sheet(isPresented: $model.showEmailPreview) {
             EmailPreviewView(
-                emails: $parsedEmails,
-                selectedEmailIndices: $selectedEmailIndices,
-                searchText: $emailSearchText,
-                isShowing: $showEmailPreview,
+                model: model,
+                preferHTML: settings.preferHTML,
                 onConfirm: {
-                    showEmailPreview = false
-                    generatePDFs()
+                    model.showEmailPreview = false
+                    model.convertSelected(settings: settings, history: historyManager)
                 }
             )
         }
@@ -161,109 +140,134 @@ struct HomeView: View {
     }
 
     // MARK: - File List View
+    private var totalSizeText: String {
+        let total = model.selectedFiles.reduce(Int64(0)) { $0 + Self.fileSize($1) }
+        return ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
+    }
+
+    private static func fileSize(_ url: URL) -> Int64 {
+        Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+    }
+
     private var fileListView: some View {
-        VStack(spacing: 0) {
-            // Header
-            HStack {
-                Text("Selected Files")
-                    .font(.title2)
-                    .fontWeight(.semibold)
-                Spacer()
-                Button("Clear") {
-                    reset()
-                }
-                .buttonStyle(.bordered)
+        // The list takes whatever height is left over; the header and the
+        // action bar are pinned and always visible.
+        List {
+            ForEach(model.selectedFiles, id: \.path) { file in
+                fileRow(for: file)
             }
-            .padding()
-
-            // File list
-            ScrollView {
-                VStack(spacing: 8) {
-                    ForEach(selectedFiles, id: \.path) { file in
-                        fileRow(for: file)
+        }
+        .listStyle(.inset)
+        .onDrop(of: [.fileURL], isTargeted: $isDragging) { providers in
+            handleDrop(providers: providers)
+            return true
+        }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            VStack(spacing: 0) {
+                HStack(spacing: 8) {
+                    Text("Selected Files")
+                        .font(.headline)
+                    Text("\(model.selectedFiles.count) file\(model.selectedFiles.count == 1 ? "" : "s") · \(totalSizeText)")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                Divider()
+            }
+            .background(Color(NSColor.windowBackgroundColor))
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            VStack(spacing: 0) {
+                Divider()
+                HStack {
+                    Button("Add Files…", action: selectFiles)
+                    Button("Clear") {
+                        model.reset()
                     }
+                    Spacer()
+                    Button("Process Files") {
+                        model.processFiles(settings: settings, history: historyManager)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(model.selectedFiles.isEmpty)
                 }
-                .padding()
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
             }
-
-            Divider()
-
-            // Bottom bar
-            HStack {
-                Spacer()
-
-                Button("Process Files") {
-                    processFiles()
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(selectedFiles.isEmpty)
-            }
-            .padding()
+            .background(Color(NSColor.windowBackgroundColor))
         }
     }
 
     private func fileRow(for file: URL) -> some View {
-        HStack {
+        HStack(spacing: 8) {
             Image(systemName: "doc.fill")
                 .foregroundColor(.blue)
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text(file.lastPathComponent)
-                    .font(.body)
-                if let fileSize = try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? Int64 {
-                    Text(ByteCountFormatter.string(fromByteCount: fileSize, countStyle: .file))
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-            }
+            Text(file.lastPathComponent)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(file.path)
 
-            Spacer()
+            Spacer(minLength: 12)
+
+            Text(ByteCountFormatter.string(fromByteCount: Self.fileSize(file), countStyle: .file))
+                .font(.callout)
+                .foregroundColor(.secondary)
+                .monospacedDigit()
 
             Button(action: {
-                selectedFiles.removeAll { $0 == file }
+                model.removeFile(file)
             }) {
                 Image(systemName: "xmark.circle.fill")
-                    .foregroundColor(.red)
+                    .foregroundColor(.secondary)
             }
             .buttonStyle(.plain)
+            .help("Remove from list")
         }
-        .padding()
-        .background(Color(NSColor.controlBackgroundColor))
-        .cornerRadius(8)
+        .padding(.vertical, 2)
     }
 
     // MARK: - Processing View
     private var processingView: some View {
         VStack(spacing: 20) {
-            ProgressView(value: progress, total: 1.0)
+            ProgressView(value: model.progress, total: 1.0)
                 .progressViewStyle(.linear)
                 .frame(width: 300)
 
-            Text(statusMessage)
+            Text(model.statusMessage)
                 .font(.headline)
+                .lineLimit(2)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 500)
 
-            Text(String(format: "%.0f%% complete", progress * 100))
+            Text(String(format: "%.0f%% complete", model.progress * 100))
                 .font(.caption)
                 .foregroundColor(.secondary)
+                .monospacedDigit()
 
             Button("Cancel") {
-                shouldCancelProcessing = true
+                model.cancel()
             }
             .buttonStyle(.bordered)
+            .disabled(model.isCancelling)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     // MARK: - Actions
     private func selectFiles() {
+        guard !model.isProcessing else { return }
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
-        panel.allowedContentTypes = [UTType(filenameExtension: "mbox")!, UTType(filenameExtension: "mbx")!]
+        panel.allowedContentTypes = ["mbox", "mbx"].compactMap { UTType(filenameExtension: $0) }
 
         if panel.runModal() == .OK {
-            selectedFiles = panel.urls
+            model.addFiles(panel.urls)
             // Add to recent files
             for url in panel.urls {
                 appDelegate?.addToRecentFiles(url)
@@ -272,277 +276,15 @@ struct HomeView: View {
     }
 
     private func handleDrop(providers: [NSItemProvider]) {
-        var newFiles: [URL] = []
-        let group = DispatchGroup()
-
         for provider in providers {
-            group.enter()
-            _ = provider.loadObject(ofClass: URL.self) { url, error in
-                if let url = url, url.pathExtension.lowercased() == "mbox" || url.pathExtension.lowercased() == "mbx" {
-                    DispatchQueue.main.async {
-                        if !self.selectedFiles.contains(url) {
-                            self.selectedFiles.append(url)
-                            newFiles.append(url)
-                        }
-                        group.leave()
-                    }
-                } else {
-                    group.leave()
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                guard let url, ConversionViewModel.isMBOX(url) else { return }
+                Task { @MainActor in
+                    model.addFiles([url])
+                    appDelegate?.addToRecentFiles(url)
                 }
             }
         }
-
-        group.notify(queue: .main) {
-            // Files added
-        }
-    }
-
-    private func processFiles() {
-        isProcessing = true
-        shouldCancelProcessing = false
-        statusMessage = "Processing MBOX files..."
-        progress = 0.0
-        conversionStartTime = Date()
-
-        Task {
-            do {
-                // Parse all MBOX files
-                var allEmails: [Email] = []
-                var totalSkipped = 0
-
-                for (index, fileURL) in selectedFiles.enumerated() {
-                    // Calculate progress range for this file
-                    let fileStartProgress = Double(index) / Double(selectedFiles.count)
-                    let fileProgressRange = 1.0 / Double(selectedFiles.count)
-
-                    let parseResult = try await MBOXParserStreaming.parse(
-                        fileURL: fileURL,
-                        progressCallback: { fileProgress, message in
-                            await MainActor.run {
-                                self.progress = fileStartProgress + (fileProgress * fileProgressRange)
-                                self.statusMessage = "\(fileURL.lastPathComponent): \(message)"
-                            }
-                        },
-                        shouldCancel: { self.shouldCancelProcessing }
-                    )
-
-                    allEmails.append(contentsOf: parseResult.emails)
-                    totalSkipped += parseResult.skipped.count
-                }
-
-                // Store parsed emails
-                self.parsedEmails = allEmails
-                self.totalSkippedCount = totalSkipped
-                self.selectedEmailIndices = Set(allEmails.map { $0.index })
-
-                await MainActor.run {
-                    self.isProcessing = false
-
-                    // Show preview if enabled, otherwise go straight to PDF generation
-                    if self.settings.showEmailPreview {
-                        self.showEmailPreview = true
-                    } else {
-                        // Generate PDFs immediately without preview
-                        self.generatePDFs()
-                    }
-                }
-            } catch {
-                await MainActor.run {
-                    // Check if it was a user cancellation
-                    if let parserError = error as? MBOXParserStreaming.ParserError,
-                       case .cancelled = parserError {
-                        // User cancelled - log to history
-                        isProcessing = false
-                        let duration = Date().timeIntervalSince(conversionStartTime ?? Date())
-                        let historyItem = ConversionHistoryItem(
-                            date: Date(),
-                            mboxFiles: selectedFiles.map { $0.lastPathComponent },
-                            status: .cancelled,
-                            totalEmails: 0,
-                            skippedEmails: 0,
-                            outputPath: "N/A",
-                            outputType: settings.separatePDFs ? .separatePDFs : .singlePDF,
-                            duration: duration
-                        )
-                        historyManager.addItem(historyItem)
-                    } else {
-                        errorMessage = error.localizedDescription
-                        showError = true
-                        isProcessing = false
-
-                        // Log to history
-                        let duration = Date().timeIntervalSince(conversionStartTime ?? Date())
-                        let historyItem = ConversionHistoryItem(
-                            date: Date(),
-                            mboxFiles: selectedFiles.map { $0.lastPathComponent },
-                            status: .failed,
-                            totalEmails: 0,
-                            skippedEmails: 0,
-                            outputPath: error.localizedDescription,
-                            outputType: settings.separatePDFs ? .separatePDFs : .singlePDF,
-                            duration: duration
-                        )
-                        historyManager.addItem(historyItem)
-                    }
-                }
-            }
-        }
-    }
-
-    private func generatePDFs() {
-        // Filter emails based on selection
-        let selectedEmails = parsedEmails.filter { selectedEmailIndices.contains($0.index) }
-
-        guard !selectedEmails.isEmpty else { return }
-
-        isProcessing = true
-        statusMessage = "Generating PDFs..."
-        progress = 0.0
-
-        Task {
-            do {
-                // Generate PDFs - must create panel on main thread
-                let (response, outputURL) = await MainActor.run {
-                    let savePanel = NSSavePanel()
-                    savePanel.canCreateDirectories = true
-
-                    if settings.separatePDFs {
-                        savePanel.message = "Choose location for ZIP file"
-                        savePanel.allowedContentTypes = [.zip]
-                        savePanel.nameFieldStringValue = "emails.zip"
-                    } else {
-                        savePanel.message = "Choose location for PDF"
-                        savePanel.allowedContentTypes = [.pdf]
-                        savePanel.nameFieldStringValue = "emails.pdf"
-                    }
-
-                    let response = savePanel.runModal()
-                    return (response, savePanel.url)
-                }
-
-                if response == .OK, let outputURL = outputURL {
-                    if settings.separatePDFs {
-                        // Generate separate PDFs in temp directory
-                        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-                        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-
-                        let pdfURLs = try await PDFGenerator.generateSeparatePDFs(
-                            emails: selectedEmails,
-                            outputDirectory: tempDir,
-                            settings: settings,
-                            progressCallback: { pdfProgress, message in
-                                await MainActor.run {
-                                    self.progress = pdfProgress
-                                    self.statusMessage = message
-                                }
-                            }
-                        )
-
-                        await MainActor.run {
-                            statusMessage = "Creating ZIP archive..."
-                            progress = 0.95
-                        }
-
-                        try PDFGenerator.createZIPArchive(pdfURLs: pdfURLs, outputURL: outputURL)
-
-                        // Cleanup temp directory
-                        try? FileManager.default.removeItem(at: tempDir)
-
-                        await MainActor.run {
-                            var message = "Successfully converted \(selectedEmails.count) email(s) to \(pdfURLs.count) PDF file(s)"
-                            if totalSkippedCount > 0 {
-                                message += "\n\n⚠️ Skipped \(totalSkippedCount) malformed email(s) during parsing\n(Check Xcode console for details)"
-                            }
-                            successMessage = message
-                            outputFolderURL = outputURL
-                            showSuccess = true
-                            isProcessing = false
-                            progress = 1.0
-
-                            // Log to history
-                            let duration = Date().timeIntervalSince(conversionStartTime ?? Date())
-                            let historyItem = ConversionHistoryItem(
-                                date: Date(),
-                                mboxFiles: selectedFiles.map { $0.lastPathComponent },
-                                status: .success,
-                                totalEmails: selectedEmails.count,
-                                skippedEmails: totalSkippedCount,
-                                outputPath: outputURL.path,
-                                outputType: .separatePDFs,
-                                duration: duration
-                            )
-                            historyManager.addItem(historyItem)
-                        }
-                    } else {
-                        try await PDFGenerator.generateSinglePDF(emails: selectedEmails, outputURL: outputURL, settings: settings)
-
-                        await MainActor.run {
-                            var message = "Successfully converted \(selectedEmails.count) email(s) to PDF"
-                            if totalSkippedCount > 0 {
-                                message += "\n\n⚠️ Skipped \(totalSkippedCount) malformed email(s) during parsing\n(Check Xcode console for details)"
-                            }
-                            successMessage = message
-                            outputFolderURL = outputURL
-                            showSuccess = true
-                            isProcessing = false
-                            progress = 1.0
-
-                            // Log to history
-                            let duration = Date().timeIntervalSince(conversionStartTime ?? Date())
-                            let historyItem = ConversionHistoryItem(
-                                date: Date(),
-                                mboxFiles: selectedFiles.map { $0.lastPathComponent },
-                                status: .success,
-                                totalEmails: selectedEmails.count,
-                                skippedEmails: totalSkippedCount,
-                                outputPath: outputURL.path,
-                                outputType: .singlePDF,
-                                duration: duration
-                            )
-                            historyManager.addItem(historyItem)
-                        }
-                    }
-                } else {
-                    // User cancelled the save dialog
-                    await MainActor.run {
-                        isProcessing = false
-                    }
-                }
-            } catch {
-                await MainActor.run {
-                    errorMessage = error.localizedDescription
-                    showError = true
-                    isProcessing = false
-
-                    // Log to history
-                    let duration = Date().timeIntervalSince(conversionStartTime ?? Date())
-                    let historyItem = ConversionHistoryItem(
-                        date: Date(),
-                        mboxFiles: selectedFiles.map { $0.lastPathComponent },
-                        status: .failed,
-                        totalEmails: 0,
-                        skippedEmails: totalSkippedCount,
-                        outputPath: error.localizedDescription,
-                        outputType: settings.separatePDFs ? .separatePDFs : .singlePDF,
-                        duration: duration
-                    )
-                    historyManager.addItem(historyItem)
-                }
-            }
-        }
-    }
-
-    private func reset() {
-        selectedFiles.removeAll()
-        isProcessing = false
-        progress = 0.0
-        statusMessage = ""
-        shouldCancelProcessing = false
-        outputFolderURL = nil
-        parsedEmails.removeAll()
-        selectedEmailIndices.removeAll()
-        emailSearchText = ""
-        totalSkippedCount = 0
     }
 }
 

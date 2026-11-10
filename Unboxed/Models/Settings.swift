@@ -41,7 +41,17 @@ class AppSettings: ObservableObject {
         }
     }
 
+    @Published var preferHTML: Bool {
+        didSet {
+            UserDefaults.standard.set(preferHTML, forKey: "preferHTML")
+        }
+    }
+
     init() {
+        // Default to the formatted (HTML) version of a message when it has one
+        let preferHTMLExists = UserDefaults.standard.object(forKey: "preferHTML") != nil
+        self.preferHTML = preferHTMLExists ? UserDefaults.standard.bool(forKey: "preferHTML") : true
+
         self.separatePDFs = UserDefaults.standard.bool(forKey: "separatePDFs")
 
         // Default to true if not set
@@ -65,47 +75,72 @@ class AppSettings: ObservableObject {
         self.bundleNonTextAttachments = UserDefaults.standard.bool(forKey: "bundleNonTextAttachments")
     }
 
-    func buildFilename(for email: Email, index: Int) -> String {
+    /// A thread-safe snapshot of the settings for use by the conversion pipeline.
+    var options: ConversionOptions {
+        ConversionOptions(
+            separatePDFs: separatePDFs,
+            mergeAttachmentsIntoPDF: mergeAttachmentsIntoPDF,
+            bundleNonTextAttachments: bundleNonTextAttachments,
+            preferHTML: preferHTML,
+            namingComponents: namingComponents
+        )
+    }
+
+    func buildFilename(for email: EmailSummary, index: Int) -> String {
+        options.buildFilename(for: email, index: index)
+    }
+}
+
+/// Immutable copy of the conversion settings that can be passed to background work.
+nonisolated struct ConversionOptions: Sendable {
+    var separatePDFs: Bool
+    var mergeAttachmentsIntoPDF: Bool
+    var bundleNonTextAttachments: Bool
+    var preferHTML: Bool
+    var namingComponents: [NamingComponent]
+
+    var needsAttachmentData: Bool { mergeAttachmentsIntoPDF || bundleNonTextAttachments }
+
+    func buildFilename(for email: EmailSummary, index: Int) -> String {
         var parts: [String] = [String(format: "%06d", index)]
 
         for component in namingComponents where component.enabled {
             switch component.type {
             case .subject:
-                let sanitized = sanitizeFilename(email.subject.isEmpty ? "No Subject" : email.subject, maxLength: 50)
-                parts.append(sanitized)
+                parts.append(ConversionOptions.sanitizeFilename(email.subject.isEmpty ? "No Subject" : email.subject, maxLength: 50))
             case .date:
-                let sanitized = sanitizeFilename(email.shortDate, maxLength: 20)
-                parts.append(sanitized)
+                parts.append(ConversionOptions.sanitizeFilename(email.shortDate, maxLength: 20))
             case .sender:
-                let sanitized = sanitizeFilename(email.senderName, maxLength: 30)
-                parts.append(sanitized)
+                parts.append(ConversionOptions.sanitizeFilename(email.senderName, maxLength: 30))
             }
         }
 
         return parts.joined(separator: "_") + ".pdf"
     }
 
-    private func sanitizeFilename(_ text: String, maxLength: Int) -> String {
-        var sanitized = text
-        // Remove invalid filename characters
-        let invalidChars = CharacterSet(charactersIn: "<>:\"/\\|?*")
-            .union(.controlCharacters)
-        sanitized = sanitized.components(separatedBy: invalidChars).joined(separator: "_")
+    private static let invalidFilenameCharacters = CharacterSet(charactersIn: "<>:\"/\\|?*")
+        .union(.controlCharacters)
+        .union(.newlines)
 
-        // Trim whitespace and dots
+    static func sanitizeFilename(_ text: String, maxLength: Int) -> String {
+        var sanitized = text.components(separatedBy: invalidFilenameCharacters).joined(separator: "_")
         sanitized = sanitized.trimmingCharacters(in: .whitespacesAndNewlines)
         sanitized = sanitized.trimmingCharacters(in: CharacterSet(charactersIn: "."))
 
-        // Limit length
         if sanitized.count > maxLength {
             sanitized = String(sanitized.prefix(maxLength))
         }
+        // Keep each component well inside the 255-byte filename limit.
+        while sanitized.utf8.count > maxLength * 2 {
+            sanitized.removeLast()
+        }
+        sanitized = sanitized.trimmingCharacters(in: .whitespaces)
 
         return sanitized.isEmpty ? "untitled" : sanitized
     }
 }
 
-struct NamingComponent: Identifiable, Codable {
+nonisolated struct NamingComponent: Identifiable, Codable, Sendable {
     let id: UUID
     let type: ComponentType
     var enabled: Bool
@@ -116,7 +151,7 @@ struct NamingComponent: Identifiable, Codable {
         self.enabled = enabled
     }
 
-    enum ComponentType: String, Codable, CaseIterable {
+    enum ComponentType: String, Codable, CaseIterable, Sendable {
         case subject = "Subject"
         case date = "Date"
         case sender = "Sender"

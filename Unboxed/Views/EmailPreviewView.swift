@@ -7,149 +7,65 @@
 
 import SwiftUI
 
+nonisolated enum EmailSortOrder: String, CaseIterable, Sendable {
+    case dateDescending = "Date (Newest First)"
+    case dateAscending = "Date (Oldest First)"
+    case subject = "Subject"
+    case sender = "Sender"
+
+    var systemImage: String {
+        switch self {
+        case .dateDescending: return "arrow.down"
+        case .dateAscending: return "arrow.up"
+        case .subject: return "text.alignleft"
+        case .sender: return "person"
+        }
+    }
+}
+
 struct EmailPreviewView: View {
-    @Binding var emails: [Email]
-    @Binding var selectedEmailIndices: Set<Int>
-    @Binding var searchText: String
-    @Binding var isShowing: Bool
+    @ObservedObject var model: ConversionViewModel
+    let preferHTML: Bool
     let onConfirm: () -> Void
 
-    @State private var sortOrder: SortOrder = .dateDescending
-    @State private var selectedEmail: Email?
+    @State private var sortOrder: EmailSortOrder = .dateDescending
+    @State private var activeID: Int?
+    /// The filtered, sorted list. Recomputed in the background only when the
+    /// search text or sort order changes, never on every redraw.
+    @State private var displayed: [EmailSummary] = []
+    @State private var hasLoaded = false
+    @State private var isSearchingBodies = false
 
-    enum SortOrder: String, CaseIterable {
-        case dateDescending = "Date (Newest First)"
-        case dateAscending = "Date (Oldest First)"
-        case subject = "Subject"
-        case sender = "Sender"
-
-        var systemImage: String {
-            switch self {
-            case .dateDescending: return "arrow.down"
-            case .dateAscending: return "arrow.up"
-            case .subject: return "text.alignleft"
-            case .sender: return "person"
-            }
-        }
+    private struct Query: Hashable {
+        var text: String
+        var sort: EmailSortOrder
+        var count: Int
     }
 
-    var filteredAndSortedEmails: [Email] {
-        var result = emails
+    private var selectedCount: Int { model.selectedIDs.count }
 
-        // Filter by search text
-        if !searchText.isEmpty {
-            result = result.filter { email in
-                email.subject.localizedCaseInsensitiveContains(searchText) ||
-                email.from.localizedCaseInsensitiveContains(searchText) ||
-                email.to.localizedCaseInsensitiveContains(searchText) ||
-                email.body.localizedCaseInsensitiveContains(searchText)
-            }
+    private var activeEmail: EmailSummary? {
+        guard let activeID else { return nil }
+        // ids are 1-based positions in `emails`
+        if activeID >= 1, activeID <= model.emails.count, model.emails[activeID - 1].id == activeID {
+            return model.emails[activeID - 1]
         }
-
-        // Sort
-        switch sortOrder {
-        case .dateDescending:
-            result.sort { ($0.date ?? .distantPast) > ($1.date ?? .distantPast) }
-        case .dateAscending:
-            result.sort { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) }
-        case .subject:
-            result.sort { $0.subject.localizedCaseInsensitiveCompare($1.subject) == .orderedAscending }
-        case .sender:
-            result.sort { $0.from.localizedCaseInsensitiveCompare($1.from) == .orderedAscending }
-        }
-
-        return result
-    }
-
-    var selectedCount: Int {
-        selectedEmailIndices.count
+        return model.emails.first { $0.id == activeID }
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            // Header
-            VStack(spacing: 12) {
-                HStack {
-                    Text("Email Preview & Selection")
-                        .font(.title2)
-                        .fontWeight(.semibold)
-
-                    Spacer()
-
-                    Button(action: { isShowing = false }) {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.title3)
-                            .foregroundColor(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                }
-
-                HStack(spacing: 12) {
-                    // Search field
-                    HStack {
-                        Image(systemName: "magnifyingglass")
-                            .foregroundColor(.secondary)
-                        TextField("Search emails...", text: $searchText)
-                            .textFieldStyle(.plain)
-                        if !searchText.isEmpty {
-                            Button(action: { searchText = "" }) {
-                                Image(systemName: "xmark.circle.fill")
-                                    .foregroundColor(.secondary)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(8)
-                    .background(Color(NSColor.controlBackgroundColor))
-                    .cornerRadius(8)
-
-                    // Sort picker
-                    Picker("Sort", selection: $sortOrder) {
-                        ForEach(SortOrder.allCases, id: \.self) { order in
-                            HStack {
-                                Image(systemName: order.systemImage)
-                                Text(order.rawValue)
-                            }
-                            .tag(order)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .frame(width: 200)
-                }
-
-                // Selection controls
-                HStack {
-                    Text("\(selectedCount) of \(filteredAndSortedEmails.count) selected")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-
-                    Spacer()
-
-                    Button("Select All") {
-                        selectedEmailIndices = Set(filteredAndSortedEmails.map { $0.index })
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-
-                    Button("Deselect All") {
-                        selectedEmailIndices.removeAll()
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
-            }
-            .padding()
+            header
+                .padding()
 
             Divider()
 
-            // Email list and preview
             HSplitView {
-                // Email list
                 emailListView
 
-                // Email preview
-                if let email = selectedEmail {
-                    emailDetailView(email: email)
+                if let email = activeEmail {
+                    EmailDetailView(email: email, files: model.mappedFiles, preferHTML: preferHTML)
+                        .frame(minWidth: 400)
                 } else {
                     VStack(spacing: 12) {
                         Image(systemName: "envelope.open")
@@ -159,7 +75,7 @@ struct EmailPreviewView: View {
                             .font(.title3)
                             .foregroundColor(.secondary)
                     }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(minWidth: 400, maxWidth: .infinity, maxHeight: .infinity)
                     .background(Color(NSColor.controlBackgroundColor))
                 }
             }
@@ -169,9 +85,10 @@ struct EmailPreviewView: View {
             // Bottom bar
             HStack {
                 Button("Cancel") {
-                    isShowing = false
+                    model.showEmailPreview = false
                 }
                 .buttonStyle(.bordered)
+                .keyboardShortcut(.cancelAction)
 
                 Spacer()
 
@@ -179,50 +96,239 @@ struct EmailPreviewView: View {
                     onConfirm()
                 }
                 .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
                 .disabled(selectedCount == 0)
             }
             .padding()
         }
-        .frame(minWidth: 900, minHeight: 600)
+        .frame(minWidth: 760, minHeight: 500)
+        .task(id: Query(text: model.searchText, sort: sortOrder, count: model.emails.count)) {
+            await refresh()
+        }
     }
+
+    // MARK: - Header
+
+    private var header: some View {
+        VStack(spacing: 12) {
+            HStack {
+                Text("Email Preview & Selection")
+                    .font(.title2)
+                    .fontWeight(.semibold)
+
+                Spacer()
+
+                Button(action: { model.showEmailPreview = false }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title3)
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+
+            HStack(spacing: 12) {
+                // Search field
+                HStack {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundColor(.secondary)
+                    TextField("Search emails...", text: $model.searchText)
+                        .textFieldStyle(.plain)
+                    if isSearchingBodies {
+                        ProgressView()
+                            .controlSize(.small)
+                            .help("Searching message bodies…")
+                    }
+                    if !model.searchText.isEmpty {
+                        Button(action: { model.searchText = "" }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(8)
+                .background(Color(NSColor.controlBackgroundColor))
+                .cornerRadius(8)
+
+                // Sort picker
+                Picker("Sort", selection: $sortOrder) {
+                    ForEach(EmailSortOrder.allCases, id: \.self) { order in
+                        HStack {
+                            Image(systemName: order.systemImage)
+                            Text(order.rawValue)
+                        }
+                        .tag(order)
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(width: 200)
+            }
+
+            // Selection controls
+            HStack {
+                Text(selectionSummary)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                Spacer()
+
+                Button(model.searchText.isEmpty ? "Select All" : "Select Shown") {
+                    model.selectedIDs.formUnion(displayed.map(\.id))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                if !model.searchText.isEmpty {
+                    Button("Deselect Shown") {
+                        model.selectedIDs.subtract(displayed.map(\.id))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+
+                Button("Deselect All") {
+                    model.selectedIDs.removeAll()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        }
+    }
+
+    private var selectionSummary: String {
+        if model.searchText.isEmpty {
+            return "\(selectedCount) of \(model.emails.count) selected"
+        }
+        return "\(selectedCount) of \(model.emails.count) selected · \(displayed.count) shown"
+    }
+
+    // MARK: - List
 
     private var emailListView: some View {
-        ScrollView {
-            LazyVStack(spacing: 4) {
-                ForEach(filteredAndSortedEmails, id: \.index) { email in
-                    emailRow(email: email)
+        Group {
+            if !hasLoaded {
+                ProgressView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if displayed.isEmpty {
+                Text(isSearchingBodies ? "Searching…" : "No matching emails")
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(displayed, selection: $activeID) { email in
+                    EmailRow(
+                        email: email,
+                        isSelected: model.selectedIDs.contains(email.id),
+                        toggle: { toggle(email.id) }
+                    )
+                    .tag(email.id)
                 }
+                .listStyle(.inset)
             }
-            .padding(8)
         }
-        .frame(minWidth: 300)
-        .background(Color(NSColor.windowBackgroundColor))
+        .frame(minWidth: 300, idealWidth: 380)
     }
 
-    private func emailRow(email: Email) -> some View {
-        let isSelected = selectedEmailIndices.contains(email.index)
-        let isActiveSelection = selectedEmail?.index == email.index
+    private func toggle(_ id: Int) {
+        if model.selectedIDs.contains(id) {
+            model.selectedIDs.remove(id)
+        } else {
+            model.selectedIDs.insert(id)
+        }
+    }
 
-        return HStack(alignment: .top, spacing: 12) {
-            // Checkbox
-            Button(action: {
-                if isSelected {
-                    selectedEmailIndices.remove(email.index)
-                } else {
-                    selectedEmailIndices.insert(email.index)
-                }
-            }) {
+    // MARK: - Filtering
+
+    private func refresh() async {
+        let emails = model.emails
+        let files = model.mappedFiles
+        let query = model.searchText.trimmingCharacters(in: .whitespaces)
+        let sort = sortOrder
+
+        if hasLoaded && !query.isEmpty {
+            // Debounce typing.
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            if Task.isCancelled { return }
+        }
+
+        // Headers first: instant.
+        let headerMatches = await Task.detached(priority: .userInitiated) {
+            EmailPreviewView.filterAndSort(emails, query: query, sort: sort, bodyMatches: [])
+        }.value
+        if Task.isCancelled { return }
+        displayed = headerMatches
+        hasLoaded = true
+        isSearchingBodies = false
+
+        guard query.count >= 2 else { return }
+
+        // Then message bodies, read on demand from the mapped files.
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        if Task.isCancelled { return }
+        isSearchingBodies = true
+        let alreadyMatched = Set(headerMatches.map(\.id))
+        let cancel = CancelFlag()
+        let bodyMatches = await withTaskCancellationHandler {
+            await Task.detached(priority: .utility) {
+                MBOXIndexer.searchBodies(query: query, in: emails.filter { !alreadyMatched.contains($0.id) }, files: files, cancel: cancel)
+            }.value
+        } onCancel: {
+            cancel.cancel()
+        }
+        if Task.isCancelled { return }
+        isSearchingBodies = false
+        guard !bodyMatches.isEmpty else { return }
+
+        let combined = await Task.detached(priority: .userInitiated) {
+            EmailPreviewView.filterAndSort(emails, query: query, sort: sort, bodyMatches: bodyMatches)
+        }.value
+        if Task.isCancelled { return }
+        displayed = combined
+    }
+
+    nonisolated static func filterAndSort(_ emails: [EmailSummary], query: String, sort: EmailSortOrder, bodyMatches: Set<Int>) -> [EmailSummary] {
+        var result = emails
+        if !query.isEmpty {
+            result = emails.filter { email in
+                bodyMatches.contains(email.id)
+                    || email.subject.localizedCaseInsensitiveContains(query)
+                    || email.from.localizedCaseInsensitiveContains(query)
+                    || email.to.localizedCaseInsensitiveContains(query)
+            }
+        }
+
+        switch sort {
+        case .dateDescending:
+            result.sort { ($0.date ?? .distantPast, $1.id) > ($1.date ?? .distantPast, $0.id) }
+        case .dateAscending:
+            result.sort { ($0.date ?? .distantPast, $0.id) < ($1.date ?? .distantPast, $1.id) }
+        case .subject:
+            result.sort { $0.subject.localizedCaseInsensitiveCompare($1.subject) == .orderedAscending }
+        case .sender:
+            result.sort { $0.from.localizedCaseInsensitiveCompare($1.from) == .orderedAscending }
+        }
+        return result
+    }
+}
+
+// MARK: - Row
+
+private struct EmailRow: View {
+    let email: EmailSummary
+    let isSelected: Bool
+    let toggle: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Button(action: toggle) {
                 Image(systemName: isSelected ? "checkmark.square.fill" : "square")
                     .foregroundColor(isSelected ? .blue : .secondary)
                     .font(.title3)
             }
             .buttonStyle(.plain)
 
-            // Email info
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 3) {
                 Text(email.subject)
                     .font(.body)
-                    .fontWeight(isActiveSelection ? .semibold : .regular)
                     .lineLimit(2)
 
                 Text(email.from)
@@ -248,209 +354,130 @@ struct EmailPreviewView: View {
                 }
             }
 
-            Spacer()
+            Spacer(minLength: 0)
         }
-        .padding(10)
-        .background(isActiveSelection ? Color.blue.opacity(0.1) : Color(NSColor.controlBackgroundColor))
-        .cornerRadius(6)
-        .overlay(
-            RoundedRectangle(cornerRadius: 6)
-                .stroke(isActiveSelection ? Color.blue : Color.clear, lineWidth: 2)
-        )
-        .onTapGesture {
-            selectedEmail = email
-        }
-    }
-
-    private func emailDetailView(email: Email) -> some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                // Header
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(email.subject)
-                        .font(.title2)
-                        .fontWeight(.semibold)
-
-                    HStack(spacing: 4) {
-                        Text("From:")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        Text(email.from)
-                            .font(.caption)
-                    }
-
-                    HStack(spacing: 4) {
-                        Text("To:")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        Text(email.to)
-                            .font(.caption)
-                    }
-
-                    if let cc = email.cc {
-                        HStack(spacing: 4) {
-                            Text("CC:")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                            Text(cc)
-                                .font(.caption)
-                        }
-                    }
-
-                    if let date = email.date {
-                        HStack(spacing: 4) {
-                            Text("Date:")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                            Text(date.formatted(date: .long, time: .shortened))
-                                .font(.caption)
-                        }
-                    }
-
-                    if !email.attachments.isEmpty {
-                        HStack(spacing: 8) {
-                            Image(systemName: "paperclip")
-                                .foregroundColor(.blue)
-                            Text("\(email.attachments.count) attachment\(email.attachments.count == 1 ? "" : "s")")
-                                .font(.caption)
-                                .foregroundColor(.blue)
-                        }
-                    }
-                }
-
-                Divider()
-
-                // Body
-                EmailBodyView(body: email.body)
-                    .textSelection(.enabled)
-            }
-            .padding()
-        }
-        .frame(minWidth: 400)
-        .background(Color(NSColor.controlBackgroundColor))
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
     }
 }
 
-// Helper view to render email body (HTML or plain text)
-struct EmailBodyView: NSViewRepresentable {
-    let body: String
-    
-    func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSScrollView()
-        let textView = NSTextView()
-        
-        textView.isEditable = false
-        textView.isSelectable = true
-        textView.backgroundColor = .clear
-        textView.drawsBackground = false
-        textView.textContainerInset = NSSize(width: 0, height: 0)
-        
-        scrollView.documentView = textView
-        scrollView.hasVerticalScroller = false
-        scrollView.hasHorizontalScroller = false
-        scrollView.drawsBackground = false
-        
-        return scrollView
-    }
-    
-    func updateNSView(_ scrollView: NSScrollView, context: Context) {
-        guard let textView = scrollView.documentView as? NSTextView else { return }
-        
-        // Try to render as HTML first
-        if isHTMLContent(body), let attributedString = createHTMLAttributedString(from: body) {
-            textView.textStorage?.setAttributedString(attributedString)
-        } else {
-            // Fallback to plain text
-            let attributes: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 13),
-                .foregroundColor: NSColor.textColor
-            ]
-            let plainText = NSAttributedString(string: body, attributes: attributes)
-            textView.textStorage?.setAttributedString(plainText)
-        }
-    }
-    
-    private func isHTMLContent(_ text: String) -> Bool {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let htmlPatterns = [
-            "<html", "<body", "<div", "<table", "<tr", "<td",
-            "<p>", "<br>", "<span", "<h1", "<h2", "<h3"
-        ]
-        
-        let lowercased = trimmed.lowercased()
-        if lowercased.hasPrefix("<!doctype html") || lowercased.hasPrefix("<html") {
-            return true
-        }
-        
-        let tagCount = htmlPatterns.filter { lowercased.contains($0) }.count
-        return tagCount >= 2
-    }
-    
-    private func createHTMLAttributedString(from html: String) -> NSAttributedString? {
-        // Clean up the HTML first
-        var cleanedHTML = html
-        
-        // Remove any MIME boundary markers
-        cleanedHTML = cleanedHTML.replacingOccurrences(of: #"--[0-9a-fA-F]{20,}--?"#, with: "", options: .regularExpression)
-        
-        // Remove broken/incomplete HTML tag fragments at the start
-        if let regex = try? NSRegularExpression(pattern: "^[a-zA-Z]+=\"[^\"]*\">", options: []) {
-            cleanedHTML = regex.stringByReplacingMatches(in: cleanedHTML, range: NSRange(cleanedHTML.startIndex..., in: cleanedHTML), withTemplate: "")
-        }
-        
-        // Remove broken tag fragments
-        if let regex = try? NSRegularExpression(pattern: "^[^<]*>", options: []) {
-            let trimmed = cleanedHTML.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.hasPrefix("<") {
-                cleanedHTML = regex.stringByReplacingMatches(in: cleanedHTML, range: NSRange(cleanedHTML.startIndex..., in: cleanedHTML), withTemplate: "")
+// MARK: - Detail
+
+private struct EmailDetailView: View {
+    let email: EmailSummary
+    let files: [MappedFile]
+    let preferHTML: Bool
+
+    @State private var bodyText: NSAttributedString?
+    @State private var loadedID: Int?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(email.subject)
+                    .font(.title2)
+                    .fontWeight(.semibold)
+                    .textSelection(.enabled)
+
+                headerLine("From:", email.from)
+                headerLine("To:", email.to)
+                if let cc = email.cc, !cc.isEmpty {
+                    headerLine("CC:", cc)
+                }
+                if let date = email.date {
+                    headerLine("Date:", date.formatted(date: .long, time: .shortened))
+                }
+
+                if !email.attachments.isEmpty {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "paperclip")
+                            .foregroundColor(.blue)
+                        Text(email.attachments.joined(separator: ", "))
+                            .font(.caption)
+                            .foregroundColor(.blue)
+                            .lineLimit(3)
+                    }
+                }
+            }
+            .padding()
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Divider()
+
+            if let bodyText, loadedID == email.id {
+                AttributedTextView(text: bodyText, identity: email.id)
+            } else {
+                ProgressView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color.white)
             }
         }
-        
-        cleanedHTML = cleanedHTML.trimmingCharacters(in: .whitespacesAndNewlines)
-        
-        let styledHTML = """
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="utf-8">
-            <style>
-                body {
-                    font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Helvetica, Arial, sans-serif;
-                    font-size: 13pt;
-                    line-height: 1.4;
-                    color: #000000;
-                }
-                table {
-                    border-collapse: collapse;
-                    margin: 10px 0;
-                }
-                td, th {
-                    border: 1px solid #cccccc;
-                    padding: 6px 10px;
-                }
-                th {
-                    background-color: #f0f0f0;
-                    font-weight: bold;
-                }
-                a {
-                    color: #0066cc;
-                    text-decoration: underline;
-                }
-            </style>
-        </head>
-        <body>
-        \(cleanedHTML)
-        </body>
-        </html>
-        """
-        
-        guard let data = styledHTML.data(using: .utf8) else { return nil }
-        
-        let options: [NSAttributedString.DocumentReadingOptionKey: Any] = [
-            .documentType: NSAttributedString.DocumentType.html,
-            .characterEncoding: String.Encoding.utf8.rawValue
-        ]
-        
-        return try? NSAttributedString(data: data, options: options, documentAttributes: nil)
+        .background(Color(NSColor.controlBackgroundColor))
+        .task(id: email.id) {
+            let summary = email
+            let files = files
+            let preferHTML = preferHTML
+            let rendered = await Task.detached(priority: .userInitiated) {
+                let options = MBOXIndexer.LoadOptions(preferHTML: preferHTML, loadAttachmentData: false, maxBodyLength: 300_000)
+                let parsed = MBOXIndexer.load(summary, files: files, options: options)
+                return UncheckedTransfer(value: PDFRenderer.bodyContent(for: parsed, fontSize: 13, maxImageWidth: 520))
+            }.value
+            if Task.isCancelled { return }
+            bodyText = rendered.value
+            loadedID = summary.id
+        }
+    }
+
+    private func headerLine(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .top, spacing: 4) {
+            Text(label)
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Text(value)
+                .font(.caption)
+                .lineLimit(3)
+                .textSelection(.enabled)
+        }
+    }
+}
+
+/// Read-only, scrollable rich text. Shown on a white "page" so the preview
+/// matches the PDF output in both light and dark mode.
+private struct AttributedTextView: NSViewRepresentable {
+    let text: NSAttributedString
+    let identity: Int
+
+    final class Coordinator {
+        var identity: Int?
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSTextView.scrollableTextView()
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.drawsBackground = true
+        scrollView.backgroundColor = .white
+
+        if let textView = scrollView.documentView as? NSTextView {
+            textView.isEditable = false
+            textView.isSelectable = true
+            textView.drawsBackground = true
+            textView.backgroundColor = .white
+            textView.textContainerInset = NSSize(width: 16, height: 16)
+            textView.isAutomaticLinkDetectionEnabled = false
+            textView.layoutManager?.allowsNonContiguousLayout = true
+        }
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        // Only replace the text when a different email is shown.
+        guard context.coordinator.identity != identity,
+              let textView = scrollView.documentView as? NSTextView else { return }
+        context.coordinator.identity = identity
+        textView.textStorage?.setAttributedString(text)
+        textView.scroll(.zero)
     }
 }
