@@ -26,14 +26,17 @@ struct GeneralSettingsView: View {
 
                 Toggle("Show Email Preview & Selection", isOn: $settings.showEmailPreview)
                     .help("After parsing, show a preview window to search, filter, and select specific emails before conversion")
+
+                Toggle("Prefer Formatted (HTML) Message Body", isOn: $settings.preferHTML)
+                    .help("When an email has both a formatted and a plain-text version, use the formatted one. Turn off to always use plain text when it is available. Remote images are never downloaded.")
             }
 
             Section("Attachment Handling") {
                 Toggle("Merge Text/Image Attachments into PDF", isOn: $settings.mergeAttachmentsIntoPDF)
                     .help("When enabled, text and image attachments will be embedded directly into the PDF document")
 
-                Toggle("Bundle Non-Text Attachments", isOn: $settings.bundleNonTextAttachments)
-                    .help("When enabled, creates an attachments.zip file containing all non-text/image attachments (e.g., documents, archives, executables)")
+                Toggle("Bundle Other Attachments", isOn: $settings.bundleNonTextAttachments)
+                    .help("When enabled, saves every attachment that is not merged into the PDF (e.g., documents, archives) alongside the output: in an attachments folder inside the ZIP, or in a separate attachments ZIP for a single PDF")
 
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Note: Attachments are extracted from MIME multipart email messages.")
@@ -115,21 +118,7 @@ struct GeneralSettingsView: View {
     }
 
     private func previewFilename() -> String {
-        let sampleEmail = Email(
-            index: 1,
-            subject: "Sample Subject",
-            from: "sender@example.com",
-            to: "recipient@example.com",
-            cc: nil,
-            date: Date(),
-            dateString: "2024-01-15 10:30:00",
-            body: "",
-            attachments: [],
-            attachmentData: nil,
-            sourceFile: "sample"
-        )
-
-        return settings.buildFilename(for: sampleEmail, index: 1)
+        return settings.buildFilename(for: .sample, index: 1)
     }
 }
 

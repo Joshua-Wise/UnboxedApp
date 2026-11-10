@@ -19,7 +19,7 @@ struct HistoryView: View {
                 emptyStateView
             } else {
                 ScrollView {
-                    VStack(spacing: 12) {
+                    VStack(spacing: 8) {
                         ForEach(historyManager.items) { item in
                             HistoryItemRow(item: item, onDelete: {
                                 historyManager.removeItem(item)
@@ -89,10 +89,11 @@ struct HistoryItemRow: View {
 
                 VStack(alignment: .leading, spacing: 4) {
                     // MBOX files
-                    Text(item.mboxFiles.joined(separator: ", "))
+                    Text(item.mboxFiles.count > 1 ? "\(item.mboxFiles.count) files: \(item.mboxFiles.joined(separator: ", "))" : item.mboxFiles.joined(separator: ", "))
                         .font(.body)
                         .fontWeight(.medium)
                         .lineLimit(1)
+                        .truncationMode(.middle)
 
                     // Date and stats
                     HStack(spacing: 12) {
@@ -124,7 +125,8 @@ struct HistoryItemRow: View {
                 }
                 .buttonStyle(.plain)
             }
-            .padding()
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
 
             // Expanded details
             if isExpanded {
